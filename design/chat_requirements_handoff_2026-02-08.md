@@ -111,6 +111,20 @@ Date: 2026-02-08
 - `depends_on`: `prerequisite -> dependent`
 11. Invariant checks should run in the same transaction context as write operations when feasible.
 
+## Graph-Layer Clarifications (Additional)
+Date: 2026-02-08
+
+1. Forest conceptual model:
+- Treat the project-level subtask structure as a forest container over root trees.
+- Project graph conceptually points to all root trees.
+- Exact storage/modeling details for this forest container are still open and require follow-up design.
+2. Cross-project mirrored mutations:
+- Prefer correctness over parallelism; run mirrored updates with one transactional unit of work at a time.
+3. Archive/delete/unarchive semantics:
+- Delete excises subtree tasks and corresponding graph participation.
+- Archive cascades to subtree but archived tasks are excluded from active dependency/blocking considerations.
+- Unarchive reinvolves tasks in graph considerations and must pass invariant checks before becoming active.
+
 ## Recommended `subseq_graph` Invariant Work (for separate worker)
 1. Add graph kinds: `tree`, `dag`, `directed`.
 2. Persist graph kind in schema/model.
