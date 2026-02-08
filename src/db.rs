@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::anyhow;
 use once_cell::sync::Lazy;
 use serde_json::json;
@@ -9,8 +11,9 @@ use subseq_auth::group_id::GroupId;
 use subseq_auth::user_id::UserId;
 use subseq_graph::db::get_graph;
 use subseq_graph::models::{GraphId, GraphNodeId};
+use subseq_graph::permissions as graph_perm;
 
-use crate::error::{LibError, Result};
+use crate::error::{ErrorKind, LibError, Result};
 use crate::models::{
     CreateMilestonePayload, CreateProjectPayload, CreateTaskLinkPayload, CreateTaskPayload,
     Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId, ProjectSummary, RepeatSchema,
@@ -415,6 +418,14 @@ async fn group_has_permission(
     project_id: Option<ProjectId>,
     task_id: Option<TaskId>,
 ) -> Result<bool> {
+    let permission_roles: Vec<String> = perm::access_roles(permission)
+        .iter()
+        .map(|role| (*role).to_string())
+        .collect();
+    if permission_roles.is_empty() {
+        return Ok(false);
+    }
+
     let project_scope_id = project_id.map(|id| id.0.to_string());
     let task_scope_id = task_id.map(|id| id.0.to_string());
     let row: (bool,) = sqlx::query_as(
@@ -434,7 +445,7 @@ async fn group_has_permission(
                   SELECT 1
                   FROM auth.group_roles gr
                   WHERE gr.group_id = gm.group_id
-                    AND gr.role_name = $3
+                    AND gr.role_name = ANY($3)
                     AND (
                         (gr.scope = $4 AND gr.scope_id = $5)
                         OR ($6::text IS NOT NULL AND gr.scope = $7 AND gr.scope_id = $6)
@@ -446,7 +457,7 @@ async fn group_has_permission(
     )
     .bind(group_id.0)
     .bind(actor.0)
-    .bind(permission)
+    .bind(permission_roles)
     .bind(perm::scope_tasks())
     .bind(perm::scope_id_global())
     .bind(project_scope_id)
@@ -458,6 +469,42 @@ async fn group_has_permission(
     .map_err(|err| db_err("Failed to query group permission", err))?;
 
     Ok(row.0)
+}
+
+async fn ensure_graph_read_access(pool: &PgPool, actor: UserId, graph_id: GraphId) -> Result<()> {
+    let _ = get_graph(pool, actor, graph_id, graph_perm::graph_read_access_roles())
+        .await
+        .map_err(LibError::from)?;
+    Ok(())
+}
+
+async fn ensure_project_graph_access(
+    pool: &PgPool,
+    actor: UserId,
+    task_state_graph_id: GraphId,
+    task_graph_id: Option<GraphId>,
+) -> Result<()> {
+    ensure_graph_read_access(pool, actor, task_state_graph_id).await?;
+    if let Some(task_graph_id) = task_graph_id {
+        if task_graph_id != task_state_graph_id {
+            ensure_graph_read_access(pool, actor, task_graph_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_task_assignment_graph_access(
+    pool: &PgPool,
+    actor: UserId,
+    assignments: &[TaskGraphAssignment],
+) -> Result<()> {
+    let mut checked_graph_ids = HashSet::new();
+    for assignment in assignments {
+        if checked_graph_ids.insert(assignment.graph_id.0) {
+            ensure_graph_read_access(pool, actor, assignment.graph_id).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn ensure_group_permission_for_new_resource(
@@ -915,15 +962,20 @@ pub async fn create_project_with_roles(
         pool,
         actor,
         payload.task_state_graph_id,
-        perm::project_create(),
+        graph_perm::graph_read_access_roles(),
     )
     .await
     .map_err(LibError::from)?;
 
     if let Some(task_graph_id) = payload.task_graph_id {
-        get_graph(pool, actor, task_graph_id, perm::project_create())
-            .await
-            .map_err(LibError::from)?;
+        get_graph(
+            pool,
+            actor,
+            task_graph_id,
+            graph_perm::graph_read_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
     }
 
     let project_id = ProjectId(Uuid::new_v4());
@@ -968,6 +1020,13 @@ pub async fn get_project_with_roles(
     project_id: ProjectId,
 ) -> Result<Project> {
     let row = load_accessible_project(pool, actor, project_id, perm::project_read()).await?;
+    ensure_project_graph_access(
+        pool,
+        actor,
+        GraphId(row.task_state_graph_id),
+        row.task_graph_id.map(GraphId),
+    )
+    .await?;
     Ok(to_project(row))
 }
 
@@ -1036,11 +1095,23 @@ pub async fn list_projects_with_roles(
     .await
     .map_err(|err| db_err("Failed to list projects", err))?;
 
-    Ok(Paged {
-        page,
-        limit,
-        items: rows.into_iter().map(to_project_summary).collect(),
-    })
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let access = ensure_project_graph_access(
+            pool,
+            actor,
+            GraphId(row.task_state_graph_id),
+            row.task_graph_id.map(GraphId),
+        )
+        .await;
+        match access {
+            Ok(()) => items.push(to_project_summary(row)),
+            Err(err) if err.kind == ErrorKind::Forbidden => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(Paged { page, limit, items })
 }
 
 pub async fn update_project_with_roles(
@@ -1089,7 +1160,7 @@ pub async fn update_project_with_roles(
         pool,
         actor,
         GraphId(task_state_graph_id),
-        perm::project_update(),
+        graph_perm::graph_read_access_roles(),
     )
     .await
     .map_err(LibError::from)?;
@@ -1104,9 +1175,14 @@ pub async fn update_project_with_roles(
     };
 
     if let Some(graph_id) = task_graph_id {
-        get_graph(pool, actor, GraphId(graph_id), perm::project_update())
-            .await
-            .map_err(LibError::from)?;
+        get_graph(
+            pool,
+            actor,
+            GraphId(graph_id),
+            graph_perm::graph_read_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
     }
 
     let metadata = payload.metadata.unwrap_or(existing.metadata);
@@ -1462,7 +1538,7 @@ async fn entry_node_for_graph(
     actor: UserId,
     graph_id: GraphId,
 ) -> Result<Option<GraphNodeId>> {
-    let graph = get_graph(pool, actor, graph_id, perm::task_create())
+    let graph = get_graph(pool, actor, graph_id, graph_perm::graph_read_access_roles())
         .await
         .map_err(LibError::from)?;
     Ok(graph.nodes.first().map(|node| node.id))
@@ -1641,6 +1717,7 @@ pub async fn get_task_with_roles(
     let task = to_task(row)?;
     let project_ids = get_task_project_ids(pool, task_id).await?;
     let graph_assignments = get_task_graph_assignments(pool, task_id).await?;
+    ensure_task_assignment_graph_access(pool, actor, &graph_assignments).await?;
     let links_out = get_task_links_out(pool, task_id).await?;
     let links_in = get_task_links_in(pool, task_id).await?;
 
@@ -1948,7 +2025,7 @@ pub async fn transition_task_with_roles(
         )
     })?;
 
-    let graph = get_graph(pool, actor, graph_id, perm::task_transition())
+    let graph = get_graph(pool, actor, graph_id, graph_perm::graph_read_access_roles())
         .await
         .map_err(LibError::from)?;
 

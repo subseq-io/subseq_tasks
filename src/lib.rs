@@ -28,10 +28,11 @@ pub mod prelude {
         TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
     };
     pub use crate::permissions::{
-        full_permissions, milestone_create, milestone_delete, milestone_read, milestone_update,
-        project_create, project_delete, project_read, project_update, read_permissions,
-        scope_id_global, scope_project, scope_task, scope_tasks, task_create, task_delete,
-        task_link, task_read, task_transition, task_update, write_permissions,
+        access_roles, full_permissions, milestone_create, milestone_delete, milestone_read,
+        milestone_read_access_roles, milestone_update, project_create, project_delete,
+        project_read, project_read_access_roles, project_update, read_permissions, scope_id_global,
+        scope_project, scope_task, scope_tasks, task_create, task_delete, task_link, task_read,
+        task_read_access_roles, task_transition, task_update, write_permissions,
     };
     pub use subseq_auth::group_id::GroupId;
     pub use subseq_auth::user_id::UserId;

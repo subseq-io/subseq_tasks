@@ -31,9 +31,29 @@ The following hard-coded role names are defined in `/Users/teague/Subsequent/bac
 - `task_link`: create/delete task links.
 - `task_transition`: change a task graph node assignment.
 
+## Access Behavior
+
+Write implies read for each domain boundary:
+
+- Project reads accept any of: `project_read`, `project_create`, `project_update`, `project_delete`.
+- Milestone reads accept any of: `milestone_read`, `milestone_create`, `milestone_update`, `milestone_delete`.
+- Task reads accept any of: `task_read`, `task_create`, `task_update`, `task_delete`, `task_link`, `task_transition`.
+
 ## Ownership Rule
 
 Task owners always have read/write access to their own tasks, even when group-role checks would otherwise deny access.
+
+## Task Graph Permission Coupling
+
+When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.
+
+This applies to:
+
+- Project create/update graph assignment validation.
+- Project read/list responses (graph IDs are part of the response model).
+- Task creation entry-node resolution.
+- Task details reads that include graph assignments.
+- Task transitions that validate target graph nodes.
 
 ## Permission Helpers
 
@@ -48,6 +68,11 @@ Task owners always have read/write access to their own tasks, even when group-ro
   - `project_create()`, `project_read()`, `project_update()`, `project_delete()`
   - `milestone_create()`, `milestone_read()`, `milestone_update()`, `milestone_delete()`
   - `task_create()`, `task_read()`, `task_update()`, `task_delete()`, `task_link()`, `task_transition()`
+- Access-role helpers:
+  - `project_read_access_roles()`
+  - `milestone_read_access_roles()`
+  - `task_read_access_roles()`
+  - `access_roles(permission)`
 - Role-set helpers:
   - `read_permissions()`
   - `write_permissions()`
