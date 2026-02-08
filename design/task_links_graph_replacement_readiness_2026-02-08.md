@@ -22,20 +22,44 @@ Relationship layers:
 
 `subseq_graph` is currently used as an invariant engine (projection validation), not as task-link storage.
 
-## What Existing `subseq_graph` Can Already Do
+## Reassessment After Graph Delta Updates
 
-Available and usable today:
-- Persist graph kind (`tree`, `dag`, `directed`).
-- Full-graph read/write:
-  - `create_graph`
-  - `get_graph`
-  - `update_graph` (replace full nodes+edges)
-  - `delete_graph`
-  - `extend_graph` (additive merge)
-- Fast preflight checks:
-  - `GraphMutationIndex::would_add_edge_violations`
-  - `GraphMutationIndex::would_remove_edge_violations`
-  - `GraphMutationIndex::would_remove_edge_isolate_subgraph`
+The previously missing high-impact DX entrypoints are now implemented in `subseq_graph`.
+
+Implemented and verified in code:
+- Delta edge mutation APIs:
+  - `add_edge` / `add_edge_tx`
+  - `remove_edge` / `remove_edge_tx`
+  - `upsert_edge_metadata` / `upsert_edge_metadata_tx`
+  - Source: `../subseq_graph/src/db.rs`
+- Delta node mutation APIs:
+  - `upsert_node` / `upsert_node_tx`
+  - `remove_node` / `remove_node_tx`
+  - Source: `../subseq_graph/src/db.rs`
+- Caller-owned transaction composition:
+  - all `_tx` variants accept caller transaction
+  - Source: `../subseq_graph/src/db.rs`
+- Cross-graph atomic delta batching:
+  - `apply_graph_delta_batch_tx(commands: &[GraphDeltaCommand])`
+  - each command carries its own `graph_id`
+  - Source: `../subseq_graph/src/db.rs`, `../subseq_graph/src/models.rs`
+- Optimistic concurrency:
+  - optional `expected_updated_at` on write payloads
+  - stale writes fail with `error.code = stale_graph_update`
+  - Source: `../subseq_graph/src/db.rs`, `../subseq_graph/src/models.rs`
+- Task-centric lookup helpers:
+  - node by external id
+  - incident edges by node id and by external id
+  - Source: `../subseq_graph/src/db.rs`, `../subseq_graph/src/api.rs`
+- Metadata filter helpers and indexes:
+  - `nodes @> metadata_contains`, `edges @> metadata_contains`
+  - GIN indexes + external_id expression index
+  - Source: `../subseq_graph/src/db.rs`, `../subseq_graph/migrations/20260208000500_graph_metadata_indexes.sql`
+- Existing invariant preflight helpers remain available:
+  - `would_add_edge_violations`
+  - `would_remove_edge_violations`
+  - `would_remove_edge_isolate_subgraph`
+  - Source: `../subseq_graph/src/invariants.rs`
 
 ## Required to Replace `task_links`
 
@@ -61,54 +85,41 @@ At minimum, the app must provide:
 - Implement subtree traversal from tree graph(s) for archive/unarchive/delete/impact count.
 - Define behavior when task appears in multiple project trees (union/intersection/project-scoped).
 
-## Why This Is More Than a Translational Shim
+## What Is Now a Thin Shim
 
-A pure shim would map each table write to a direct graph edge mutation call.
-Current APIs do not provide that shape. Today each mutation requires read-modify-replace of entire graph payloads plus app-side orchestration.
+For `depends_on`, `related_to`, and `assignment_order`, storage cutover can now be a mostly translational shim:
+- upsert task nodes by stable external ID metadata
+- add/remove edges via delta ops
+- mirror across shared project graphs inside one caller-owned SQL transaction
+- query incident edges or metadata-filtered edges for read assembly
 
-This is an integration redesign, not a direct storage swap.
+## Remaining Non-Shim Gap
 
-## Missing `subseq_graph` Entrypoints (DX Gaps)
+Tree reparent/detach flows (`subtask_of`) still need one additional primitive or fallback path.
 
-These are the key gaps if we want a low-complexity replacement:
+Why:
+- `add_edge_tx` and `remove_edge_tx` validate tree invariants on each individual mutation.
+- reparent requires changing parent edge(s) as a set.
+- valid final state can require invalid intermediate states:
+  - add new parent before removing old parent can violate in-degree (2 parents)
+  - remove old parent before adding new parent/root can violate single-root/connected-tree constraints
 
-1. Delta edge mutation APIs (transactional):
-- `add_edge(graph_id, from, to, metadata)`
-- `remove_edge(graph_id, from, to)`
-- `upsert_edge_metadata(...)`
-- Optional: `move_edge`/reparent helper for tree graphs
+Result:
+- a pure sequence of current tree delta operations cannot always represent reparent atomically.
 
-2. Delta node mutation APIs:
-- `upsert_node(graph_id, node_id, label, metadata)`
-- `remove_node(graph_id, node_id)` with predictable cascade semantics
+Missing entrypoint for a pure shim:
+- either a dedicated tree reparent/move helper (`move_edge` or `reparent_subtree`) that validates final state
+- or a batch mode that applies a command set then validates invariants once on the resulting graph state
 
-3. External identity lookup helpers:
-- Query node by metadata key/value (example: `taskId`) or allow external ID field.
-- Query incident edges for a node without fetching full graph.
-
-4. Read helpers for task-centric access:
-- `list_edges_for_node(graph_id, node_id, direction)`
-- Optional filters by metadata (`link_type`, state metadata).
-
-5. Multi-graph atomic/batched mutation support:
-- Execute mirrored mutations across graph IDs in one transaction boundary, or expose compensating-batch primitive.
-
-6. Transaction composition:
-- DB entrypoints that accept caller-owned transaction/executor, so task + graph writes can be one ACID unit.
-
-7. Optional optimistic concurrency:
-- Version/etag precondition on graph update to prevent lost updates in concurrent read-modify-replace flows.
+Current workaround:
+- for reparent/subtree surgery, use guarded full-graph replace (`update_graph_with_guard`) for that graph, while using delta ops for simpler mutations.
 
 ## Recommendation
 
-Two viable paths:
+The delta API surface is now strong enough to start graph-backed storage migration with substantially less glue code than before.
 
-1. Keep `task_links` authoritative short-term (current state), continue using graph checks for invariants, and defer storage migration until graph delta APIs exist.
-
-2. If migration must start now, do a staged approach:
-- Stage A: introduce project-layer graph mapping + deterministic node IDs.
-- Stage B: dual-write (`task_links` + graph edges), verify parity.
-- Stage C: switch reads to graph-backed views.
-- Stage D: remove `task_links` table only after parity and cascade/impact semantics are stable.
-
-Given current APIs, path (1) is lower risk.
+Recommended path:
+1. Move non-subtask link types to graph SOT first using delta APIs.
+2. Keep `subtask_of` on guarded replace path or retain table authority until reparent primitive lands.
+3. Dual-write and parity-check read paths.
+4. Remove `tasks.task_links` once subtree/archive/delete flows are fully graph-native.
