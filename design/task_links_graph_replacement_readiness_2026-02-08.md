@@ -22,7 +22,7 @@ Relationship layers:
 
 `subseq_graph` is currently used as an invariant engine (projection validation), not as task-link storage.
 
-## Reassessment After Graph Delta Updates
+## Reassessment After Graph Delta/Reparent Updates
 
 The previously missing high-impact DX entrypoints are now implemented in `subseq_graph`.
 
@@ -36,6 +36,10 @@ Implemented and verified in code:
   - `upsert_node` / `upsert_node_tx`
   - `remove_node` / `remove_node_tx`
   - Source: `../subseq_graph/src/db.rs`
+- Atomic tree reparent/detach APIs:
+  - `reparent_node` / `reparent_node_tx`
+  - validates tree invariants on final edge set (not remove/add intermediate states)
+  - Source: `../subseq_graph/src/db.rs`, `../subseq_graph/src/api.rs`, `../subseq_graph/src/operations.rs`
 - Caller-owned transaction composition:
   - all `_tx` variants accept caller transaction
   - Source: `../subseq_graph/src/db.rs`
@@ -74,7 +78,7 @@ At minimum, the app must provide:
 - Subtask tree graph must maintain a synthetic root node and synthetic edges to each root task.
 
 3. Link mutation orchestration:
-- For create/delete/reparent, load graph, mutate edges (and possibly nodes), validate, then replace graph.
+- For create/delete/reparent, issue delta mutations (including `reparent_node` for tree parent changes).
 - Mirror operations across all shared project graphs and block on any violation.
 
 4. Read-path reconstruction:
@@ -87,39 +91,26 @@ At minimum, the app must provide:
 
 ## What Is Now a Thin Shim
 
-For `depends_on`, `related_to`, and `assignment_order`, storage cutover can now be a mostly translational shim:
+For all link types (`subtask_of`, `depends_on`, `related_to`, `assignment_order`), storage cutover can now be mostly translational:
 - upsert task nodes by stable external ID metadata
 - add/remove edges via delta ops
+- perform tree parent changes with `reparent_node`
 - mirror across shared project graphs inside one caller-owned SQL transaction
 - query incident edges or metadata-filtered edges for read assembly
 
-## Remaining Non-Shim Gap
+## Tree Caveat
 
-Tree reparent/detach flows (`subtask_of`) still need one additional primitive or fallback path.
+`reparent_node` supports detach (`newParentNodeId = null`), but tree invariants still apply to the final state.
 
-Why:
-- `add_edge_tx` and `remove_edge_tx` validate tree invariants on each individual mutation.
-- reparent requires changing parent edge(s) as a set.
-- valid final state can require invalid intermediate states:
-  - add new parent before removing old parent can violate in-degree (2 parents)
-  - remove old parent before adding new parent/root can violate single-root/connected-tree constraints
-
-Result:
-- a pure sequence of current tree delta operations cannot always represent reparent atomically.
-
-Missing entrypoint for a pure shim:
-- either a dedicated tree reparent/move helper (`move_edge` or `reparent_subtree`) that validates final state
-- or a batch mode that applies a command set then validates invariants once on the resulting graph state
-
-Current workaround:
-- for reparent/subtree surgery, use guarded full-graph replace (`update_graph_with_guard`) for that graph, while using delta ops for simpler mutations.
+Implication:
+- detach is valid only when resulting root/connected constraints remain satisfied (or when app reattaches to the project synthetic root as part of the same logical operation).
 
 ## Recommendation
 
-The delta API surface is now strong enough to start graph-backed storage migration with substantially less glue code than before.
+The graph API surface is now sufficient to begin a true graph-SOT migration without relying on full-graph replace for normal link updates.
 
 Recommended path:
-1. Move non-subtask link types to graph SOT first using delta APIs.
-2. Keep `subtask_of` on guarded replace path or retain table authority until reparent primitive lands.
-3. Dual-write and parity-check read paths.
-4. Remove `tasks.task_links` once subtree/archive/delete flows are fully graph-native.
+1. Introduce graph node/edge identity mapping per project layer and dual-write `task_links` + graph mutations.
+2. Use delta ops for add/remove and `reparent_node` for subtask parent changes across mirrored project graphs.
+3. Switch read paths (`links_out`, `links_in`, subtree impact/cascade) to graph-backed queries once parity checks pass.
+4. Remove `tasks.task_links` once graph-backed behavior is stable under archive/unarchive/delete/reparent flows.
