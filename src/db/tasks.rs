@@ -253,6 +253,53 @@ fn transition_details(
     })
 }
 
+fn normalize_subtask_parent_state_for_link(
+    link_type: TaskLinkType,
+    subtask_parent_state: Option<TaskState>,
+) -> Result<Option<TaskState>> {
+    match link_type {
+        TaskLinkType::SubtaskOf => subtask_parent_state.map(Some).ok_or_else(|| {
+            LibError::invalid(
+                "Subtask links require a parent state",
+                anyhow!("subtask_of link missing subtask_parent_state"),
+            )
+        }),
+        _ => {
+            if subtask_parent_state.is_some() {
+                Err(LibError::invalid(
+                    "Only subtask links may set subtaskParentState",
+                    anyhow!("non-subtask link included subtaskParentState"),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn resolve_transition_assignee(
+    from_state: TaskState,
+    to_state: TaskState,
+    payload: &TransitionTaskPayload,
+    actor: UserId,
+    existing_assignee: Option<Uuid>,
+) -> Result<Option<Uuid>> {
+    let assignee = match (from_state, to_state) {
+        (TaskState::Todo, TaskState::Assigned) => {
+            Some(payload.assigned_to_user_id.map(|id| id.0).ok_or_else(|| {
+                LibError::invalid(
+                    "assignedToUserId is required for this transition",
+                    anyhow!("todo -> assigned transition missing assigned_to_user_id"),
+                )
+            })?)
+        }
+        (TaskState::Todo, TaskState::InProgress) => Some(actor.0),
+        _ => existing_assignee,
+    };
+
+    Ok(assignee)
+}
+
 async fn entry_node_for_graph(
     pool: &PgPool,
     actor: UserId,
@@ -1112,28 +1159,8 @@ pub async fn create_task_link_with_roles(
         ));
     }
 
-    let subtask_parent_state = match payload.link_type {
-        TaskLinkType::SubtaskOf => payload.subtask_parent_state.ok_or_else(|| {
-            LibError::invalid(
-                "Subtask links require a parent state",
-                anyhow!("subtask_of link missing subtask_parent_state"),
-            )
-        })?,
-        _ => {
-            if payload.subtask_parent_state.is_some() {
-                return Err(LibError::invalid(
-                    "Only subtask links may set subtaskParentState",
-                    anyhow!("non-subtask link included subtaskParentState"),
-                ));
-            }
-            TaskState::Open
-        }
-    };
-
-    let subtask_parent_state = match payload.link_type {
-        TaskLinkType::SubtaskOf => Some(subtask_parent_state),
-        _ => None,
-    };
+    let subtask_parent_state =
+        normalize_subtask_parent_state_for_link(payload.link_type, payload.subtask_parent_state)?;
 
     let mut tx = pool
         .begin()
@@ -1503,18 +1530,13 @@ pub async fn transition_task_with_roles(
         ));
     }
 
-    let assignee_user_id = match (from_state, to_state) {
-        (TaskState::Todo, TaskState::Assigned) => {
-            Some(payload.assigned_to_user_id.map(|id| id.0).ok_or_else(|| {
-                LibError::invalid(
-                    "assignedToUserId is required for this transition",
-                    anyhow!("todo -> assigned transition missing assigned_to_user_id"),
-                )
-            })?)
-        }
-        (TaskState::Todo, TaskState::InProgress) => Some(actor.0),
-        _ => existing.assignee_user_id,
-    };
+    let assignee_user_id = resolve_transition_assignee(
+        from_state,
+        to_state,
+        &payload,
+        actor,
+        existing.assignee_user_id,
+    )?;
 
     let (completed_by_user_id, completed_at) = if to_state == TaskState::Done {
         let done_by = payload.done_by_user_id.unwrap_or(actor);
@@ -1588,4 +1610,172 @@ pub async fn transition_task_with_roles(
     .await?;
 
     get_task_with_roles(pool, actor, task_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transition_payload(to_state: TaskState) -> TransitionTaskPayload {
+        TransitionTaskPayload {
+            to_state,
+            when: None,
+            assigned_to_user_id: None,
+            deferral_reason: None,
+            cant_do_reason: None,
+            estimated_time_to_complete: None,
+            work_log_details: None,
+            feedback: None,
+            done_by_user_id: None,
+            done_at: None,
+            rejected_reason: None,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn transition_allowed_supports_expected_edges() {
+        let allowed = [
+            (TaskState::Open, TaskState::Todo),
+            (TaskState::Todo, TaskState::Assigned),
+            (TaskState::Todo, TaskState::Open),
+            (TaskState::Todo, TaskState::InProgress),
+            (TaskState::Assigned, TaskState::InProgress),
+            (TaskState::Assigned, TaskState::Todo),
+            (TaskState::InProgress, TaskState::Todo),
+            (TaskState::InProgress, TaskState::Acceptance),
+            (TaskState::Acceptance, TaskState::InProgress),
+        ];
+
+        for (from_state, to_state) in allowed {
+            assert!(
+                transition_allowed(from_state, to_state),
+                "{} -> {} should be allowed",
+                from_state.as_str(),
+                to_state.as_str()
+            );
+        }
+
+        for from_state in [
+            TaskState::Open,
+            TaskState::Todo,
+            TaskState::Assigned,
+            TaskState::InProgress,
+            TaskState::Acceptance,
+        ] {
+            assert!(
+                transition_allowed(from_state, TaskState::Done),
+                "{} -> done should be allowed",
+                from_state.as_str()
+            );
+            assert!(
+                transition_allowed(from_state, TaskState::Rejected),
+                "{} -> rejected should be allowed",
+                from_state.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn transition_allowed_rejects_invalid_edges() {
+        let disallowed = [
+            (TaskState::Open, TaskState::Open),
+            (TaskState::Open, TaskState::Assigned),
+            (TaskState::Open, TaskState::InProgress),
+            (TaskState::Open, TaskState::Acceptance),
+            (TaskState::Todo, TaskState::Acceptance),
+            (TaskState::Assigned, TaskState::Acceptance),
+            (TaskState::InProgress, TaskState::Assigned),
+            (TaskState::Acceptance, TaskState::Todo),
+            (TaskState::Done, TaskState::Todo),
+            (TaskState::Rejected, TaskState::Todo),
+            (TaskState::Done, TaskState::Rejected),
+            (TaskState::Rejected, TaskState::Done),
+        ];
+
+        for (from_state, to_state) in disallowed {
+            assert!(
+                !transition_allowed(from_state, to_state),
+                "{} -> {} should be rejected",
+                from_state.as_str(),
+                to_state.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_subtask_parent_state_enforces_link_rules() {
+        let subtask_state =
+            normalize_subtask_parent_state_for_link(TaskLinkType::SubtaskOf, Some(TaskState::Todo))
+                .expect("subtask state should be accepted");
+        assert_eq!(subtask_state, Some(TaskState::Todo));
+
+        let missing_state = normalize_subtask_parent_state_for_link(TaskLinkType::SubtaskOf, None)
+            .expect_err("subtask links require state");
+        assert_eq!(missing_state.public, "Subtask links require a parent state");
+
+        let invalid_non_subtask =
+            normalize_subtask_parent_state_for_link(TaskLinkType::DependsOn, Some(TaskState::Todo))
+                .expect_err("non-subtask links should reject subtaskParentState");
+        assert_eq!(
+            invalid_non_subtask.public,
+            "Only subtask links may set subtaskParentState"
+        );
+
+        let no_state = normalize_subtask_parent_state_for_link(TaskLinkType::DependsOn, None)
+            .expect("depends_on should not require subtask state");
+        assert_eq!(no_state, None);
+    }
+
+    #[test]
+    fn resolve_transition_assignee_applies_transition_rules() {
+        let actor = UserId(Uuid::new_v4());
+        let existing_assignee = Some(Uuid::new_v4());
+
+        let missing_assignee = resolve_transition_assignee(
+            TaskState::Todo,
+            TaskState::Assigned,
+            &transition_payload(TaskState::Assigned),
+            actor,
+            existing_assignee,
+        )
+        .expect_err("todo -> assigned requires assigned_to_user_id");
+        assert_eq!(
+            missing_assignee.public,
+            "assignedToUserId is required for this transition"
+        );
+
+        let assigned_user = UserId(Uuid::new_v4());
+        let mut assigned_payload = transition_payload(TaskState::Assigned);
+        assigned_payload.assigned_to_user_id = Some(assigned_user);
+        let resolved = resolve_transition_assignee(
+            TaskState::Todo,
+            TaskState::Assigned,
+            &assigned_payload,
+            actor,
+            existing_assignee,
+        )
+        .expect("todo -> assigned should resolve assignee");
+        assert_eq!(resolved, Some(assigned_user.0));
+
+        let in_progress = resolve_transition_assignee(
+            TaskState::Todo,
+            TaskState::InProgress,
+            &transition_payload(TaskState::InProgress),
+            actor,
+            existing_assignee,
+        )
+        .expect("todo -> in_progress should self-assign");
+        assert_eq!(in_progress, Some(actor.0));
+
+        let preserved = resolve_transition_assignee(
+            TaskState::Assigned,
+            TaskState::Todo,
+            &transition_payload(TaskState::Todo),
+            actor,
+            existing_assignee,
+        )
+        .expect("assigned -> todo should preserve existing assignee");
+        assert_eq!(preserved, existing_assignee);
+    }
 }
