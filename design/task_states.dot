@@ -1,0 +1,76 @@
+digraph TaskStateMachine {
+    rankdir=LR;
+    bgcolor="white";
+    fontname="Inter";
+    labelloc="t";
+    label="Task State Transitions";
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Inter",
+        fontsize=12,
+        fillcolor="#F6F8FA",
+        color="#D0D7DE"
+    ];
+
+    edge [
+        fontname="Inter",
+        fontsize=10,
+        color="#57606A"
+    ];
+
+    Open;
+    Todo;
+    Assigned;
+    InProgress [label="In Progress"];
+    Acceptance;
+    Done [shape=doublecircle, style="filled", fillcolor="#E6FFEC", color="#2DA44E"];
+    Rejected [shape=doublecircle, style="filled", fillcolor="#FFEBE9", color="#CF222E"];
+
+    // Explicit transitions (with edge data)
+    Open -> Todo [
+        label="Todo\nwhen? (optional)"
+    ];
+
+    Todo -> Assigned [
+        label="Assigned\nto who? (required)"
+    ];
+    Todo -> Open [
+        label="Open\ndeferral reason? (optional)"
+    ];
+    Todo -> InProgress [
+        label="In Progress\nassigned to self"
+    ];
+
+    Assigned -> InProgress [
+        label="In Progress\nestimated time-to-complete? (optional)"
+    ];
+    Assigned -> Todo [
+        label="Todo\ncan't do reason? (optional)"
+    ];
+
+    InProgress -> Todo [
+        label="Todo\ncan't do reason? (optional)"
+    ];
+    InProgress -> Acceptance [
+        label="Acceptance\nwork log details? (optional)"
+    ];
+
+    Acceptance -> InProgress [
+        label="In Progress\nfeedback? (optional)"
+    ];
+
+    // Global short-circuit transitions (all nodes -> Done/Rejected)
+    Open -> Done [style=dashed, label="Done\nby whom? (optional), timestamp"];
+    Todo -> Done [style=dashed, label="Done\nby whom? (optional), timestamp"];
+    Assigned -> Done [style=dashed, label="Done\nby whom? (optional), timestamp"];
+    InProgress -> Done [style=dashed, label="Done\nby whom? (optional), timestamp"];
+    Acceptance -> Done [style=dashed, label="Done\nby whom? (optional), timestamp"];
+
+    Open -> Rejected [style=dashed, label="Rejected\nreason? (optional)"];
+    Todo -> Rejected [style=dashed, label="Rejected\nreason? (optional)"];
+    Assigned -> Rejected [style=dashed, label="Rejected\nreason? (optional)"];
+    InProgress -> Rejected [style=dashed, label="Rejected\nreason? (optional)"];
+    Acceptance -> Rejected [style=dashed, label="Rejected\nreason? (optional)"];
+}
