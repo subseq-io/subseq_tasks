@@ -6,7 +6,7 @@ use subseq_graph::models::{GraphId, GraphNodeId};
 
 use super::{MilestoneId, ProjectId, TaskCommentId, TaskId, TaskLinkType, TaskLogId, TaskState};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     pub id: TaskId,
@@ -14,13 +14,23 @@ pub struct Task {
     pub title: String,
     pub description: String,
     pub author_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_username: Option<String>,
     pub assignee_user_id: Option<UserId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee_username: Option<String>,
     pub priority: i32,
     pub due_date: Option<NaiveDateTime>,
     pub milestone_id: Option<MilestoneId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub milestone_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub milestone_type: Option<String>,
     pub state: TaskState,
     pub archived: bool,
     pub completed_by_user_id: Option<UserId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_by_username: Option<String>,
     pub completed_at: Option<NaiveDateTime>,
     pub rejected_reason: Option<String>,
     pub metadata: Value,
@@ -28,7 +38,7 @@ pub struct Task {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskGraphAssignment {
     pub graph_id: GraphId,
@@ -37,34 +47,40 @@ pub struct TaskGraphAssignment {
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskLink {
     pub task_from_id: TaskId,
     pub task_to_id: TaskId,
     pub link_type: TaskLinkType,
     pub subtask_parent_state: Option<TaskState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_task_title: Option<String>,
     pub created_at: NaiveDateTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskComment {
     pub id: TaskCommentId,
     pub task_id: TaskId,
     pub author_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_username: Option<String>,
     pub body: String,
     pub metadata: Value,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskLogEntry {
     pub id: TaskLogId,
     pub task_id: TaskId,
     pub actor_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_username: Option<String>,
     pub action: String,
     pub from_state: Option<TaskState>,
     pub to_state: Option<TaskState>,
@@ -72,11 +88,22 @@ pub struct TaskLogEntry {
     pub created_at: NaiveDateTime,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskProjectPresentation {
+    pub id: ProjectId,
+    pub name: String,
+    pub slug: String,
+    pub order_added: i32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDetails {
     pub task: Task,
     pub project_ids: Vec<ProjectId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<TaskProjectPresentation>,
     pub graph_assignments: Vec<TaskGraphAssignment>,
     pub links_out: Vec<TaskLink>,
     pub links_in: Vec<TaskLink>,

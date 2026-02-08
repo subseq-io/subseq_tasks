@@ -162,3 +162,11 @@ Implemented in this repo during this chat:
 
 ## Process Preference Captured
 Future requirement/design discussions should be written to a Markdown file in the repo (for example under `/design`) rather than only existing in chat text.
+
+## Presentation Shaping Addendum
+Date: 2026-02-08
+
+To reduce API-side fanout and repeated joins while assembling task presentation payloads:
+- Use a Postgres denormalized view (`tasks.task_presentation`) as the source for task detail rendering.
+- Include user display fields, milestone display fields, project summaries, and task-adjacent record aggregates in that view.
+- Keep canonical normalized tables as write sources; the view is read-oriented presentation infrastructure.

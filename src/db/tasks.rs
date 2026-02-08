@@ -670,25 +670,20 @@ pub async fn get_task_with_roles(
     actor: UserId,
     task_id: TaskId,
 ) -> Result<TaskDetails> {
-    let row = load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
-    let task = to_task(row)?;
-    let project_ids = get_task_project_ids(pool, task_id).await?;
-    let graph_assignments = get_task_graph_assignments(pool, task_id).await?;
-    ensure_task_assignment_graph_access(pool, actor, &graph_assignments).await?;
-    let links_out = get_task_links_out(pool, task_id).await?;
-    let links_in = get_task_links_in(pool, task_id).await?;
-    let comments = get_task_comments(pool, task_id, TASK_DETAILS_LIMIT).await?;
-    let log = get_task_log_entries(pool, task_id, TASK_DETAILS_LIMIT).await?;
+    let _ = load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
+    let row = load_task_presentation_row(pool, task_id).await?;
+    let details = match row {
+        Some(row) => to_task_details_from_presentation_row(row)?,
+        None => {
+            return Err(LibError::database(
+                "Failed to load task details",
+                anyhow!("task {task_id} was accessible but missing from task presentation view"),
+            ));
+        }
+    };
 
-    Ok(TaskDetails {
-        task,
-        project_ids,
-        graph_assignments,
-        links_out,
-        links_in,
-        comments,
-        log,
-    })
+    ensure_task_assignment_graph_access(pool, actor, &details.graph_assignments).await?;
+    Ok(details)
 }
 
 pub async fn list_tasks_with_roles(

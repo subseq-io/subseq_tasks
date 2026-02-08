@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::anyhow;
 use once_cell::sync::Lazy;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::{FromRow, PgPool};
@@ -10,7 +11,7 @@ use uuid::Uuid;
 use subseq_auth::group_id::GroupId;
 use subseq_auth::user_id::UserId;
 use subseq_graph::db::get_graph;
-use subseq_graph::models::{GraphId, GraphNodeId};
+use subseq_graph::models::GraphId;
 use subseq_graph::permissions as graph_perm;
 
 use crate::error::{ErrorKind, LibError, Result};
@@ -19,8 +20,8 @@ use crate::models::{
     CreateTaskPayload, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
     ProjectSummary, RepeatSchema, Task, TaskCascadeImpact, TaskCascadeImpactQuery,
     TaskCascadeOperation, TaskComment, TaskCommentId, TaskDetails, TaskGraphAssignment, TaskId,
-    TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskState, TransitionTaskPayload,
-    UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
+    TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskProjectPresentation, TaskState,
+    TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
 };
 use crate::permissions as perm;
 
@@ -131,6 +132,39 @@ struct TaskRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+struct TaskPresentationRow {
+    id: Uuid,
+    slug: String,
+    title: String,
+    description: String,
+    author_user_id: Uuid,
+    author_username: Option<String>,
+    assignee_user_id: Option<Uuid>,
+    assignee_username: Option<String>,
+    priority: i32,
+    due_date: Option<chrono::NaiveDateTime>,
+    milestone_id: Option<Uuid>,
+    milestone_name: Option<String>,
+    milestone_type: Option<String>,
+    state: String,
+    archived: bool,
+    completed_by_user_id: Option<Uuid>,
+    completed_by_username: Option<String>,
+    completed_at: Option<chrono::NaiveDateTime>,
+    rejected_reason: Option<String>,
+    metadata: serde_json::Value,
+    created_at: chrono::NaiveDateTime,
+    updated_at: chrono::NaiveDateTime,
+    project_ids: Vec<Uuid>,
+    projects: serde_json::Value,
+    graph_assignments: serde_json::Value,
+    links_out: serde_json::Value,
+    links_in: serde_json::Value,
+    comments: serde_json::Value,
+    log: serde_json::Value,
+}
+
+#[derive(Debug, Clone, FromRow)]
 struct TaskLinkRow {
     task_from_id: Uuid,
     task_to_id: Uuid,
@@ -160,14 +194,6 @@ struct TaskLogRow {
     to_state: Option<String>,
     details: serde_json::Value,
     created_at: chrono::NaiveDateTime,
-}
-
-#[derive(Debug, Clone, FromRow)]
-struct TaskGraphAssignmentRow {
-    graph_id: Uuid,
-    current_node_id: Option<Uuid>,
-    order_added: i32,
-    updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -352,28 +378,24 @@ fn to_task(row: TaskRow) -> Result<Task> {
         title: row.title,
         description: row.description,
         author_user_id: UserId(row.author_user_id),
+        author_username: None,
         assignee_user_id: row.assignee_user_id.map(UserId),
+        assignee_username: None,
         priority: row.priority,
         due_date: row.due_date,
         milestone_id: row.milestone_id.map(MilestoneId),
+        milestone_name: None,
+        milestone_type: None,
         state: task_state_from_row(&row.state)?,
         archived: row.archived,
         completed_by_user_id: row.completed_by_user_id.map(UserId),
+        completed_by_username: None,
         completed_at: row.completed_at,
         rejected_reason: row.rejected_reason,
         metadata: row.metadata,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
-}
-
-fn to_task_graph_assignment(row: TaskGraphAssignmentRow) -> TaskGraphAssignment {
-    TaskGraphAssignment {
-        graph_id: GraphId(row.graph_id),
-        current_node_id: row.current_node_id.map(GraphNodeId),
-        order_added: row.order_added,
-        updated_at: row.updated_at,
-    }
 }
 
 fn to_task_link(row: TaskLinkRow) -> Result<TaskLink> {
@@ -386,6 +408,7 @@ fn to_task_link(row: TaskLinkRow) -> Result<TaskLink> {
             .as_deref()
             .map(task_state_from_row)
             .transpose()?,
+        other_task_title: None,
         created_at: row.created_at,
     })
 }
@@ -395,6 +418,7 @@ fn to_task_comment(row: TaskCommentRow) -> TaskComment {
         id: TaskCommentId(row.id),
         task_id: TaskId(row.task_id),
         author_user_id: UserId(row.author_user_id),
+        author_username: None,
         body: row.body,
         metadata: row.metadata,
         created_at: row.created_at,
@@ -407,6 +431,7 @@ fn to_task_log(row: TaskLogRow) -> Result<TaskLogEntry> {
         id: TaskLogId(row.id),
         task_id: TaskId(row.task_id),
         actor_user_id: UserId(row.actor_user_id),
+        actor_username: None,
         action: row.action,
         from_state: row
             .from_state
@@ -420,6 +445,75 @@ fn to_task_log(row: TaskLogRow) -> Result<TaskLogEntry> {
             .transpose()?,
         details: row.details,
         created_at: row.created_at,
+    })
+}
+
+fn parse_json_array<T>(value: serde_json::Value, context: &'static str) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(_) => serde_json::from_value(value).map_err(|err| {
+            LibError::database(
+                format!("Failed to decode {context}"),
+                anyhow!("invalid {context} payload: {err}"),
+            )
+        }),
+        other => Err(LibError::database(
+            format!("Failed to decode {context}"),
+            anyhow!("expected JSON array for {context}, got {other}"),
+        )),
+    }
+}
+
+fn to_task_from_presentation_row(row: &TaskPresentationRow) -> Result<Task> {
+    Ok(Task {
+        id: TaskId(row.id),
+        slug: row.slug.clone(),
+        title: row.title.clone(),
+        description: row.description.clone(),
+        author_user_id: UserId(row.author_user_id),
+        author_username: row.author_username.clone(),
+        assignee_user_id: row.assignee_user_id.map(UserId),
+        assignee_username: row.assignee_username.clone(),
+        priority: row.priority,
+        due_date: row.due_date,
+        milestone_id: row.milestone_id.map(MilestoneId),
+        milestone_name: row.milestone_name.clone(),
+        milestone_type: row.milestone_type.clone(),
+        state: task_state_from_row(&row.state)?,
+        archived: row.archived,
+        completed_by_user_id: row.completed_by_user_id.map(UserId),
+        completed_by_username: row.completed_by_username.clone(),
+        completed_at: row.completed_at,
+        rejected_reason: row.rejected_reason.clone(),
+        metadata: row.metadata.clone(),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn to_task_details_from_presentation_row(row: TaskPresentationRow) -> Result<TaskDetails> {
+    let task = to_task_from_presentation_row(&row)?;
+    let project_ids = row.project_ids.into_iter().map(ProjectId).collect();
+    let projects: Vec<TaskProjectPresentation> = parse_json_array(row.projects, "task projects")?;
+    let graph_assignments: Vec<TaskGraphAssignment> =
+        parse_json_array(row.graph_assignments, "task graph assignments")?;
+    let links_out: Vec<TaskLink> = parse_json_array(row.links_out, "outgoing task links")?;
+    let links_in: Vec<TaskLink> = parse_json_array(row.links_in, "incoming task links")?;
+    let comments: Vec<TaskComment> = parse_json_array(row.comments, "task comments")?;
+    let log: Vec<TaskLogEntry> = parse_json_array(row.log, "task log entries")?;
+
+    Ok(TaskDetails {
+        task,
+        project_ids,
+        projects,
+        graph_assignments,
+        links_out,
+        links_in,
+        comments,
+        log,
     })
 }
 
@@ -931,92 +1025,51 @@ async fn accessible_project_ids(
     Ok(ids)
 }
 
-async fn get_task_project_ids(pool: &PgPool, task_id: TaskId) -> Result<Vec<ProjectId>> {
-    let rows = sqlx::query_as::<_, (Uuid,)>(
-        r#"
-        SELECT tp.project_id
-        FROM tasks.task_projects tp
-        JOIN tasks.projects p
-          ON p.id = tp.project_id
-        WHERE tp.task_id = $1
-          AND p.deleted_at IS NULL
-        ORDER BY tp.order_added ASC, tp.project_id ASC
-        "#,
-    )
-    .bind(task_id.0)
-    .fetch_all(pool)
-    .await
-    .map_err(|err| db_err("Failed to query task projects", err))?;
-
-    Ok(rows.into_iter().map(|row| ProjectId(row.0)).collect())
-}
-
-async fn get_task_graph_assignments(
+async fn load_task_presentation_row(
     pool: &PgPool,
     task_id: TaskId,
-) -> Result<Vec<TaskGraphAssignment>> {
-    let rows = sqlx::query_as::<_, TaskGraphAssignmentRow>(
+) -> Result<Option<TaskPresentationRow>> {
+    sqlx::query_as::<_, TaskPresentationRow>(
         r#"
         SELECT
-            graph_id,
-            current_node_id,
-            order_added,
-            updated_at
-        FROM tasks.task_graph_assignments
-        WHERE task_id = $1
-        ORDER BY order_added ASC, graph_id ASC
+            id,
+            slug,
+            title,
+            description,
+            author_user_id,
+            author_username,
+            assignee_user_id,
+            assignee_username,
+            priority,
+            due_date,
+            milestone_id,
+            milestone_name,
+            milestone_type,
+            state,
+            archived,
+            completed_by_user_id,
+            completed_by_username,
+            completed_at,
+            rejected_reason,
+            metadata,
+            created_at,
+            updated_at,
+            project_ids,
+            projects,
+            graph_assignments,
+            links_out,
+            links_in,
+            comments,
+            log
+        FROM tasks.task_presentation
+        WHERE id = $1
+        LIMIT 1
         "#,
     )
     .bind(task_id.0)
-    .fetch_all(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(|err| db_err("Failed to query task graph assignments", err))?;
-
-    Ok(rows.into_iter().map(to_task_graph_assignment).collect())
-}
-
-async fn get_task_links_out(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskLink>> {
-    let rows = sqlx::query_as::<_, TaskLinkRow>(
-        r#"
-        SELECT
-            task_from_id,
-            task_to_id,
-            link_type,
-            subtask_parent_state,
-            created_at
-        FROM tasks.task_links
-        WHERE task_from_id = $1
-        ORDER BY created_at DESC, task_to_id ASC
-        "#,
-    )
-    .bind(task_id.0)
-    .fetch_all(pool)
-    .await
-    .map_err(|err| db_err("Failed to query outgoing task links", err))?;
-
-    rows.into_iter().map(to_task_link).collect()
-}
-
-async fn get_task_links_in(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskLink>> {
-    let rows = sqlx::query_as::<_, TaskLinkRow>(
-        r#"
-        SELECT
-            task_from_id,
-            task_to_id,
-            link_type,
-            subtask_parent_state,
-            created_at
-        FROM tasks.task_links
-        WHERE task_to_id = $1
-        ORDER BY created_at DESC, task_from_id ASC
-        "#,
-    )
-    .bind(task_id.0)
-    .fetch_all(pool)
-    .await
-    .map_err(|err| db_err("Failed to query incoming task links", err))?;
-
-    rows.into_iter().map(to_task_link).collect()
+    .map_err(|err| db_err("Failed to query task presentation", err))
 }
 
 async fn append_task_log(

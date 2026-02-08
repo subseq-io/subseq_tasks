@@ -98,6 +98,19 @@ For UI confirmation flows, use:
 
 to retrieve affected task counts.
 
+## Task Presentation View
+
+Task details presentation is denormalized in Postgres view `tasks.task_presentation`.
+
+The view pre-joins and aggregates:
+
+- Usernames for task actors (`author`, `assignee`, `completed_by`) and comment/log actors.
+- Milestone display fields (`milestone_name`, `milestone_type`).
+- Project summaries and project IDs for the task.
+- Task-adjacent tables (`task_graph_assignments`, `task_links`, `task_comments`, `task_log`) as JSON arrays.
+
+`GET /task/{task_id}` reads from this view to assemble the details response in one DB query path after authorization.
+
 ## Task Graph Permission Coupling
 
 When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.
