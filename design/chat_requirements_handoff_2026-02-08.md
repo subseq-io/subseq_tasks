@@ -170,3 +170,8 @@ To reduce API-side fanout and repeated joins while assembling task presentation 
 - Use a Postgres denormalized view (`tasks.task_presentation`) as the source for task detail rendering.
 - Include user display fields, milestone display fields, project summaries, and task-adjacent record aggregates in that view.
 - Keep canonical normalized tables as write sources; the view is read-oriented presentation infrastructure.
+
+Extended follow-up:
+- Apply the same denormalized presentation pattern to project and milestone read responses.
+- Project reads should include owner display context (username/group display name) and aggregate counts from a presentation view.
+- Milestone reads should include project display context and project-owner display context from a presentation view.

@@ -12,7 +12,11 @@ use super::ProjectId;
 pub struct Project {
     pub id: ProjectId,
     pub owner_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_username: Option<String>,
     pub owner_group_id: Option<GroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_display_name: Option<String>,
     pub name: String,
     pub slug: String,
     pub description: String,
@@ -28,7 +32,11 @@ pub struct Project {
 pub struct ProjectSummary {
     pub id: ProjectId,
     pub owner_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_username: Option<String>,
     pub owner_group_id: Option<GroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_display_name: Option<String>,
     pub name: String,
     pub slug: String,
     pub description: String,

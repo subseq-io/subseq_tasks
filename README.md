@@ -111,6 +111,15 @@ The view pre-joins and aggregates:
 
 `GET /task/{task_id}` reads from this view to assemble the details response in one DB query path after authorization.
 
+## Project And Milestone Presentation Views
+
+Project and milestone responses are also denormalized for UI-friendly presentation:
+
+- `tasks.project_presentation` enriches projects with owner username/group display name and aggregate counts.
+- `tasks.milestone_presentation` enriches milestones with project display context and project owner display fields.
+
+`GET /project/{project_id}`, `GET /project`, `GET /milestone/{milestone_id}`, and `GET /milestone` read from these views after authorization checks.
+
 ## Task Graph Permission Coupling
 
 When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.

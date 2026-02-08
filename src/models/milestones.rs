@@ -1,6 +1,8 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use subseq_auth::group_id::GroupId;
+use subseq_auth::user_id::UserId;
 
 use super::{DeadlineSource, MilestoneId, ProjectId, RepeatSchema, TimelineSource};
 
@@ -57,6 +59,18 @@ impl MilestoneType {
 pub struct Milestone {
     pub id: MilestoneId,
     pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_owner_user_id: Option<UserId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_owner_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_owner_group_id: Option<GroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_owner_group_display_name: Option<String>,
     pub milestone_type: MilestoneType,
     pub name: String,
     pub description: String,

@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+
 use super::*;
 
 pub async fn create_milestone_with_roles(
@@ -77,8 +79,17 @@ pub async fn get_milestone_with_roles(
     actor: UserId,
     milestone_id: MilestoneId,
 ) -> Result<Milestone> {
-    let row = load_accessible_milestone(pool, actor, milestone_id, perm::milestone_read()).await?;
-    to_milestone(row)
+    let _ = load_accessible_milestone(pool, actor, milestone_id, perm::milestone_read()).await?;
+    let presentation = load_milestone_presentation_row(pool, milestone_id).await?;
+    match presentation {
+        Some(row) => to_milestone_from_presentation_row(row),
+        None => Err(LibError::database(
+            "Failed to load milestone details",
+            anyhow!(
+                "milestone {milestone_id} was accessible but missing from milestone presentation"
+            ),
+        )),
+    }
 }
 
 pub async fn list_milestones_with_roles(
@@ -110,34 +121,36 @@ pub async fn list_milestones_with_roles(
 
     let offset = (page.saturating_sub(1) as i64).saturating_mul(limit as i64);
 
-    let rows = sqlx::query_as::<_, MilestoneRow>(
+    let rows = sqlx::query_as::<_, MilestonePresentationRow>(
         r#"
         SELECT
-            m.id,
-            m.project_id,
-            m.milestone_type,
-            m.name,
-            m.description,
-            m.due_date,
-            m.start_date,
-            m.started,
-            m.completed,
-            m.completed_date,
-            m.repeat_interval_seconds,
-            m.repeat_end,
-            m.repeat_schema,
-            m.metadata,
-            m.created_at,
-            m.updated_at
-        FROM tasks.milestones m
-        JOIN tasks.projects p
-          ON p.id = m.project_id
-        WHERE m.deleted_at IS NULL
-          AND p.deleted_at IS NULL
-          AND p.id = ANY($1)
-          AND ($2::uuid IS NULL OR m.project_id = $2)
-          AND ($3::bool IS NULL OR m.completed = $3)
-        ORDER BY m.due_date ASC NULLS LAST, m.created_at DESC, m.id DESC
+            id,
+            project_id,
+            project_name,
+            project_slug,
+            project_owner_user_id,
+            project_owner_username,
+            project_owner_group_id,
+            project_owner_group_display_name,
+            milestone_type,
+            name,
+            description,
+            due_date,
+            start_date,
+            started,
+            completed,
+            completed_date,
+            repeat_interval_seconds,
+            repeat_end,
+            repeat_schema,
+            metadata,
+            created_at,
+            updated_at
+        FROM tasks.milestone_presentation
+        WHERE project_id = ANY($1)
+          AND ($2::uuid IS NULL OR project_id = $2)
+          AND ($3::bool IS NULL OR completed = $3)
+        ORDER BY due_date ASC NULLS LAST, created_at DESC, id DESC
         LIMIT $4 OFFSET $5
         "#,
     )
@@ -152,7 +165,7 @@ pub async fn list_milestones_with_roles(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        items.push(to_milestone(row)?);
+        items.push(to_milestone_from_presentation_row(row)?);
     }
 
     Ok(Paged { page, limit, items })

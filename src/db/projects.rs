@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+
 use super::*;
 
 pub async fn create_project_with_roles(
@@ -83,7 +85,14 @@ pub async fn get_project_with_roles(
         row.task_graph_id.map(GraphId),
     )
     .await?;
-    Ok(to_project(row))
+    let presentation = load_project_presentation_row(pool, project_id).await?;
+    match presentation {
+        Some(presentation) => Ok(to_project_from_presentation_row(presentation)),
+        None => Err(LibError::database(
+            "Failed to load project details",
+            anyhow!("project {project_id} was accessible but missing from project presentation"),
+        )),
+    }
 }
 
 pub async fn list_projects_with_roles(
@@ -102,45 +111,27 @@ pub async fn list_projects_with_roles(
         });
     }
 
-    let rows = sqlx::query_as::<_, ProjectSummaryRow>(
+    let rows = sqlx::query_as::<_, ProjectPresentationRow>(
         r#"
         SELECT
-            p.id,
-            p.owner_user_id,
-            p.owner_group_id,
-            p.name,
-            p.slug,
-            p.description,
-            p.task_state_graph_id,
-            p.task_graph_id,
-            p.created_at,
-            p.updated_at,
-            COALESCE(task_counts.task_count, 0) AS task_count,
-            COALESCE(milestone_counts.milestone_count, 0) AS milestone_count
-        FROM tasks.projects p
-        LEFT JOIN (
-            SELECT
-                tp.project_id,
-                COUNT(DISTINCT tp.task_id)::bigint AS task_count
-            FROM tasks.task_projects tp
-            JOIN tasks.tasks t
-              ON t.id = tp.task_id
-            WHERE t.deleted_at IS NULL
-            GROUP BY tp.project_id
-        ) task_counts
-          ON task_counts.project_id = p.id
-        LEFT JOIN (
-            SELECT
-                m.project_id,
-                COUNT(*)::bigint AS milestone_count
-            FROM tasks.milestones m
-            WHERE m.deleted_at IS NULL
-            GROUP BY m.project_id
-        ) milestone_counts
-          ON milestone_counts.project_id = p.id
-        WHERE p.deleted_at IS NULL
-          AND p.id = ANY($1)
-        ORDER BY p.updated_at DESC, p.id DESC
+            id,
+            owner_user_id,
+            owner_username,
+            owner_group_id,
+            owner_group_display_name,
+            name,
+            slug,
+            description,
+            task_state_graph_id,
+            task_graph_id,
+            metadata,
+            created_at,
+            updated_at,
+            task_count,
+            milestone_count
+        FROM tasks.project_presentation
+        WHERE id = ANY($1)
+        ORDER BY updated_at DESC, id DESC
         LIMIT $2 OFFSET $3
         "#,
     )
@@ -161,7 +152,7 @@ pub async fn list_projects_with_roles(
         )
         .await;
         match access {
-            Ok(()) => items.push(to_project_summary(row)),
+            Ok(()) => items.push(to_project_summary_from_presentation_row(row)),
             Err(err) if err.kind == ErrorKind::Forbidden => continue,
             Err(err) => return Err(err),
         }

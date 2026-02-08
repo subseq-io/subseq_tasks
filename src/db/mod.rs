@@ -39,7 +39,6 @@ pub async fn create_task_tables(pool: &PgPool) -> std::result::Result<(), Migrat
 
 #[derive(Debug, Clone, FromRow)]
 struct ProjectRow {
-    id: Uuid,
     owner_user_id: Uuid,
     owner_group_id: Option<Uuid>,
     name: String,
@@ -48,20 +47,21 @@ struct ProjectRow {
     task_state_graph_id: Uuid,
     task_graph_id: Option<Uuid>,
     metadata: serde_json::Value,
-    created_at: chrono::NaiveDateTime,
-    updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, Clone, FromRow)]
-struct ProjectSummaryRow {
+struct ProjectPresentationRow {
     id: Uuid,
     owner_user_id: Uuid,
+    owner_username: Option<String>,
     owner_group_id: Option<Uuid>,
+    owner_group_display_name: Option<String>,
     name: String,
     slug: String,
     description: String,
     task_state_graph_id: Uuid,
     task_graph_id: Option<Uuid>,
+    metadata: serde_json::Value,
     created_at: chrono::NaiveDateTime,
     updated_at: chrono::NaiveDateTime,
     task_count: i64,
@@ -70,8 +70,30 @@ struct ProjectSummaryRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct MilestoneRow {
+    milestone_type: String,
+    name: String,
+    description: String,
+    due_date: Option<chrono::NaiveDateTime>,
+    start_date: chrono::NaiveDateTime,
+    started: bool,
+    completed: bool,
+    completed_date: Option<chrono::NaiveDateTime>,
+    repeat_interval_seconds: Option<i64>,
+    repeat_end: Option<chrono::NaiveDateTime>,
+    repeat_schema: Option<serde_json::Value>,
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct MilestonePresentationRow {
     id: Uuid,
     project_id: Uuid,
+    project_name: Option<String>,
+    project_slug: Option<String>,
+    project_owner_user_id: Option<Uuid>,
+    project_owner_username: Option<String>,
+    project_owner_group_id: Option<Uuid>,
+    project_owner_group_display_name: Option<String>,
     milestone_type: String,
     name: String,
     description: String,
@@ -90,7 +112,6 @@ struct MilestoneRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct MilestoneAccessRow {
-    id: Uuid,
     project_id: Uuid,
     milestone_type: String,
     name: String,
@@ -104,8 +125,6 @@ struct MilestoneAccessRow {
     repeat_end: Option<chrono::NaiveDateTime>,
     repeat_schema: Option<serde_json::Value>,
     metadata: serde_json::Value,
-    created_at: chrono::NaiveDateTime,
-    updated_at: chrono::NaiveDateTime,
     project_owner_user_id: Uuid,
     project_owner_group_id: Option<Uuid>,
 }
@@ -317,11 +336,13 @@ fn task_link_type_from_row(value: &str) -> Result<TaskLinkType> {
     })
 }
 
-fn to_project(row: ProjectRow) -> Project {
+fn to_project_from_presentation_row(row: ProjectPresentationRow) -> Project {
     Project {
         id: ProjectId(row.id),
         owner_user_id: UserId(row.owner_user_id),
+        owner_username: row.owner_username,
         owner_group_id: row.owner_group_id.map(GroupId),
+        owner_group_display_name: row.owner_group_display_name,
         name: row.name,
         slug: row.slug,
         description: row.description,
@@ -333,11 +354,13 @@ fn to_project(row: ProjectRow) -> Project {
     }
 }
 
-fn to_project_summary(row: ProjectSummaryRow) -> ProjectSummary {
+fn to_project_summary_from_presentation_row(row: ProjectPresentationRow) -> ProjectSummary {
     ProjectSummary {
         id: ProjectId(row.id),
         owner_user_id: UserId(row.owner_user_id),
+        owner_username: row.owner_username,
         owner_group_id: row.owner_group_id.map(GroupId),
+        owner_group_display_name: row.owner_group_display_name,
         name: row.name,
         slug: row.slug,
         description: row.description,
@@ -350,10 +373,16 @@ fn to_project_summary(row: ProjectSummaryRow) -> ProjectSummary {
     }
 }
 
-fn to_milestone(row: MilestoneRow) -> Result<Milestone> {
+fn to_milestone_from_presentation_row(row: MilestonePresentationRow) -> Result<Milestone> {
     Ok(Milestone {
         id: MilestoneId(row.id),
         project_id: ProjectId(row.project_id),
+        project_name: row.project_name,
+        project_slug: row.project_slug,
+        project_owner_user_id: row.project_owner_user_id.map(UserId),
+        project_owner_username: row.project_owner_username,
+        project_owner_group_id: row.project_owner_group_id.map(GroupId),
+        project_owner_group_display_name: row.project_owner_group_display_name,
         milestone_type: milestone_type_from_row(&row.milestone_type)?,
         name: row.name,
         description: row.description,
@@ -731,7 +760,6 @@ async fn load_project_row(pool: &PgPool, project_id: ProjectId) -> Result<Option
     sqlx::query_as::<_, ProjectRow>(
         r#"
         SELECT
-            p.id,
             p.owner_user_id,
             p.owner_group_id,
             p.name,
@@ -739,9 +767,7 @@ async fn load_project_row(pool: &PgPool, project_id: ProjectId) -> Result<Option
             p.description,
             p.task_state_graph_id,
             p.task_graph_id,
-            p.metadata,
-            p.created_at,
-            p.updated_at
+            p.metadata
         FROM tasks.projects p
         WHERE p.id = $1
           AND p.deleted_at IS NULL
@@ -794,7 +820,6 @@ async fn load_accessible_milestone(
     let row = sqlx::query_as::<_, MilestoneAccessRow>(
         r#"
         SELECT
-            m.id,
             m.project_id,
             m.milestone_type,
             m.name,
@@ -808,8 +833,6 @@ async fn load_accessible_milestone(
             m.repeat_end,
             m.repeat_schema,
             m.metadata,
-            m.created_at,
-            m.updated_at,
             p.owner_user_id AS project_owner_user_id,
             p.owner_group_id AS project_owner_group_id
         FROM tasks.milestones m
@@ -838,8 +861,6 @@ async fn load_accessible_milestone(
         .await?;
 
         Ok(MilestoneRow {
-            id: row.id,
-            project_id: row.project_id,
             milestone_type: row.milestone_type,
             name: row.name,
             description: row.description,
@@ -852,8 +873,6 @@ async fn load_accessible_milestone(
             repeat_end: row.repeat_end,
             repeat_schema: row.repeat_schema,
             metadata: row.metadata,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
         })
     } else if milestone_exists(pool, milestone_id).await? {
         Err(LibError::forbidden(
@@ -1070,6 +1089,79 @@ async fn load_task_presentation_row(
     .fetch_optional(pool)
     .await
     .map_err(|err| db_err("Failed to query task presentation", err))
+}
+
+async fn load_project_presentation_row(
+    pool: &PgPool,
+    project_id: ProjectId,
+) -> Result<Option<ProjectPresentationRow>> {
+    sqlx::query_as::<_, ProjectPresentationRow>(
+        r#"
+        SELECT
+            id,
+            owner_user_id,
+            owner_username,
+            owner_group_id,
+            owner_group_display_name,
+            name,
+            slug,
+            description,
+            task_state_graph_id,
+            task_graph_id,
+            metadata,
+            created_at,
+            updated_at,
+            task_count,
+            milestone_count
+        FROM tasks.project_presentation
+        WHERE id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| db_err("Failed to query project presentation", err))
+}
+
+async fn load_milestone_presentation_row(
+    pool: &PgPool,
+    milestone_id: MilestoneId,
+) -> Result<Option<MilestonePresentationRow>> {
+    sqlx::query_as::<_, MilestonePresentationRow>(
+        r#"
+        SELECT
+            id,
+            project_id,
+            project_name,
+            project_slug,
+            project_owner_user_id,
+            project_owner_username,
+            project_owner_group_id,
+            project_owner_group_display_name,
+            milestone_type,
+            name,
+            description,
+            due_date,
+            start_date,
+            started,
+            completed,
+            completed_date,
+            repeat_interval_seconds,
+            repeat_end,
+            repeat_schema,
+            metadata,
+            created_at,
+            updated_at
+        FROM tasks.milestone_presentation
+        WHERE id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(milestone_id.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| db_err("Failed to query milestone presentation", err))
 }
 
 async fn append_task_log(
