@@ -45,11 +45,7 @@ pub trait HasPool {
     fn pool(&self) -> Arc<sqlx::PgPool>;
 }
 
-pub trait TasksApp: HasPool + ValidatesIdentity {
-    fn allowed_group_roles(&self) -> Option<Vec<String>> {
-        None
-    }
-}
+pub trait TasksApp: HasPool + ValidatesIdentity {}
 
 async fn create_project_handler<S>(
     State(app): State<S>,
@@ -59,14 +55,7 @@ async fn create_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let project = db::create_project_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let project = db::create_project_with_roles(&app.pool(), auth_user.id(), payload).await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -79,15 +68,7 @@ where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
     let (page, limit) = query.pagination();
-    let allowed_roles = app.allowed_group_roles();
-    let projects = db::list_projects_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        page,
-        limit,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let projects = db::list_projects_with_roles(&app.pool(), auth_user.id(), page, limit).await?;
     Ok(Json(projects))
 }
 
@@ -99,14 +80,7 @@ async fn get_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let project = db::get_project_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        project_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let project = db::get_project_with_roles(&app.pool(), auth_user.id(), project_id).await?;
     Ok(Json(project))
 }
 
@@ -119,15 +93,8 @@ async fn update_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let project = db::update_project_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        project_id,
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let project =
+        db::update_project_with_roles(&app.pool(), auth_user.id(), project_id, payload).await?;
     Ok(Json(project))
 }
 
@@ -139,14 +106,7 @@ async fn delete_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    db::delete_project_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        project_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    db::delete_project_with_roles(&app.pool(), auth_user.id(), project_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -158,14 +118,7 @@ async fn create_milestone_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let milestone = db::create_milestone_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let milestone = db::create_milestone_with_roles(&app.pool(), auth_user.id(), payload).await?;
     Ok((StatusCode::CREATED, Json(milestone)))
 }
 
@@ -178,7 +131,6 @@ where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
     let (page, limit) = query.pagination();
-    let allowed_roles = app.allowed_group_roles();
     let milestones = db::list_milestones_with_roles(
         &app.pool(),
         auth_user.id(),
@@ -186,7 +138,6 @@ where
         query.completed,
         page,
         limit,
-        allowed_roles.as_deref(),
     )
     .await?;
     Ok(Json(milestones))
@@ -200,14 +151,7 @@ async fn get_milestone_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let milestone = db::get_milestone_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        milestone_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let milestone = db::get_milestone_with_roles(&app.pool(), auth_user.id(), milestone_id).await?;
     Ok(Json(milestone))
 }
 
@@ -220,15 +164,8 @@ async fn update_milestone_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let milestone = db::update_milestone_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        milestone_id,
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let milestone =
+        db::update_milestone_with_roles(&app.pool(), auth_user.id(), milestone_id, payload).await?;
     Ok(Json(milestone))
 }
 
@@ -240,14 +177,7 @@ async fn delete_milestone_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    db::delete_milestone_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        milestone_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    db::delete_milestone_with_roles(&app.pool(), auth_user.id(), milestone_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -259,14 +189,7 @@ async fn create_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let task = db::create_task_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let task = db::create_task_with_roles(&app.pool(), auth_user.id(), payload).await?;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -279,7 +202,6 @@ where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
     let (page, limit) = query.pagination();
-    let allowed_roles = app.allowed_group_roles();
     let tasks = db::list_tasks_with_roles(
         &app.pool(),
         auth_user.id(),
@@ -289,7 +211,6 @@ where
         query.archived,
         page,
         limit,
-        allowed_roles.as_deref(),
     )
     .await?;
     Ok(Json(tasks))
@@ -303,14 +224,7 @@ async fn get_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let task = db::get_task_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let task = db::get_task_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     Ok(Json(task))
 }
 
@@ -323,15 +237,7 @@ async fn update_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let task = db::update_task_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let task = db::update_task_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
     Ok(Json(task))
 }
 
@@ -343,14 +249,7 @@ async fn delete_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    db::delete_task_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    db::delete_task_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -363,15 +262,8 @@ async fn create_task_link_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let link = db::create_task_link_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let link =
+        db::create_task_link_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
     Ok((StatusCode::CREATED, Json(link)))
 }
 
@@ -383,15 +275,7 @@ async fn delete_task_links_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    db::delete_task_links_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        other_task_id,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    db::delete_task_links_with_roles(&app.pool(), auth_user.id(), task_id, other_task_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -404,15 +288,8 @@ async fn transition_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
-    let allowed_roles = app.allowed_group_roles();
-    let task = db::transition_task_with_roles(
-        &app.pool(),
-        auth_user.id(),
-        task_id,
-        payload,
-        allowed_roles.as_deref(),
-    )
-    .await?;
+    let task =
+        db::transition_task_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
     Ok(Json(task))
 }
 

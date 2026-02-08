@@ -4,6 +4,7 @@ pub mod api;
 pub mod db;
 pub mod error;
 pub mod models;
+pub mod permissions;
 
 pub mod prelude {
     #[cfg(feature = "api")]
@@ -25,6 +26,12 @@ pub mod prelude {
         MilestoneType, Paged, Project, ProjectId, ProjectSummary, RepeatSchema, Task, TaskDetails,
         TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskState, TimelineSource,
         TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
+    };
+    pub use crate::permissions::{
+        full_permissions, milestone_create, milestone_delete, milestone_read, milestone_update,
+        project_create, project_delete, project_read, project_update, read_permissions,
+        scope_id_global, scope_project, scope_task, scope_tasks, task_create, task_delete,
+        task_link, task_read, task_transition, task_update, write_permissions,
     };
     pub use subseq_auth::group_id::GroupId;
     pub use subseq_auth::user_id::UserId;

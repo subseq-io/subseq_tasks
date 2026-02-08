@@ -17,6 +17,7 @@ use crate::models::{
     Task, TaskDetails, TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskState,
     TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
 };
+use crate::permissions as perm;
 
 pub static MIGRATOR: Lazy<Migrator> = Lazy::new(|| {
     let mut migrator = sqlx::migrate!("./migrations");
@@ -82,6 +83,28 @@ struct MilestoneRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
+struct MilestoneAccessRow {
+    id: Uuid,
+    project_id: Uuid,
+    milestone_type: String,
+    name: String,
+    description: String,
+    due_date: Option<chrono::NaiveDateTime>,
+    start_date: chrono::NaiveDateTime,
+    started: bool,
+    completed: bool,
+    completed_date: Option<chrono::NaiveDateTime>,
+    repeat_interval_seconds: Option<i64>,
+    repeat_end: Option<chrono::NaiveDateTime>,
+    repeat_schema: Option<serde_json::Value>,
+    metadata: serde_json::Value,
+    created_at: chrono::NaiveDateTime,
+    updated_at: chrono::NaiveDateTime,
+    project_owner_user_id: Uuid,
+    project_owner_group_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, FromRow)]
 struct TaskRow {
     id: Uuid,
     slug: String,
@@ -115,12 +138,15 @@ struct TaskGraphAssignmentRow {
     updated_at: chrono::NaiveDateTime,
 }
 
-fn db_err(public: &'static str, err: sqlx::Error) -> LibError {
-    LibError::database(public, anyhow!(err))
+#[derive(Debug, Clone, FromRow)]
+struct TaskProjectPermissionRow {
+    project_id: Uuid,
+    owner_user_id: Uuid,
+    owner_group_id: Option<Uuid>,
 }
 
-fn role_filter(allowed_roles: Option<&[String]>) -> Option<Vec<String>> {
-    allowed_roles.map(|roles| roles.to_vec())
+fn db_err(public: &'static str, err: sqlx::Error) -> LibError {
+    LibError::database(public, anyhow!(err))
 }
 
 fn normalize_name(name: &str, kind: &'static str) -> Result<String> {
@@ -381,13 +407,16 @@ async fn task_exists(pool: &PgPool, task_id: TaskId) -> Result<bool> {
     Ok(exists.0)
 }
 
-async fn ensure_group_member(
+async fn group_has_permission(
     pool: &PgPool,
     actor: UserId,
     group_id: GroupId,
-    allowed_roles: Option<&[String]>,
-) -> Result<()> {
-    let roles = role_filter(allowed_roles);
+    permission: &str,
+    project_id: Option<ProjectId>,
+    task_id: Option<TaskId>,
+) -> Result<bool> {
+    let project_scope_id = project_id.map(|id| id.0.to_string());
+    let task_scope_id = task_id.map(|id| id.0.to_string());
     let row: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
@@ -401,35 +430,94 @@ async fn ensure_group_member(
               AND gm.user_id = $2
               AND g.active = TRUE
               AND u.active = TRUE
-              AND ($3::text[] IS NULL OR gm.role_name = ANY($3))
+              AND EXISTS (
+                  SELECT 1
+                  FROM auth.group_roles gr
+                  WHERE gr.group_id = gm.group_id
+                    AND gr.role_name = $3
+                    AND (
+                        (gr.scope = $4 AND gr.scope_id = $5)
+                        OR ($6::text IS NOT NULL AND gr.scope = $7 AND gr.scope_id = $6)
+                        OR ($8::text IS NOT NULL AND gr.scope = $9 AND gr.scope_id = $8)
+                    )
+              )
         )
         "#,
     )
     .bind(group_id.0)
     .bind(actor.0)
-    .bind(roles)
+    .bind(permission)
+    .bind(perm::scope_tasks())
+    .bind(perm::scope_id_global())
+    .bind(project_scope_id)
+    .bind(perm::scope_project())
+    .bind(task_scope_id)
+    .bind(perm::scope_task())
     .fetch_one(pool)
     .await
-    .map_err(|err| db_err("Failed to query group membership", err))?;
+    .map_err(|err| db_err("Failed to query group permission", err))?;
 
-    if row.0 {
+    Ok(row.0)
+}
+
+async fn ensure_group_permission_for_new_resource(
+    pool: &PgPool,
+    actor: UserId,
+    group_id: GroupId,
+    permission: &str,
+) -> Result<()> {
+    if group_has_permission(pool, actor, group_id, permission, None, None).await? {
         Ok(())
     } else {
         Err(LibError::forbidden(
-            "You are not a member of this group",
-            anyhow!("user {actor} is not in group {group_id}"),
+            "You do not have group permissions for this action",
+            anyhow!("user {actor} is missing group permission {permission} in group {group_id}"),
         ))
     }
 }
 
-async fn load_accessible_project(
+async fn ensure_project_owner_or_group_permission(
     pool: &PgPool,
     actor: UserId,
     project_id: ProjectId,
-    allowed_roles: Option<&[String]>,
-) -> Result<ProjectRow> {
-    let roles = role_filter(allowed_roles);
-    let row = sqlx::query_as::<_, ProjectRow>(
+    owner_user_id: Uuid,
+    owner_group_id: Option<Uuid>,
+    permission: &str,
+) -> Result<()> {
+    if owner_user_id == actor.0 {
+        return Ok(());
+    }
+
+    if let Some(group_id) = owner_group_id {
+        if group_has_permission(
+            pool,
+            actor,
+            GroupId(group_id),
+            permission,
+            Some(project_id),
+            None,
+        )
+        .await?
+        {
+            Ok(())
+        } else {
+            Err(LibError::forbidden(
+                "You do not have project permissions for this action",
+                anyhow!(
+                    "user {actor} is missing project permission {permission} on project {project_id}"
+                ),
+            ))
+        }
+    } else {
+        Err(LibError::forbidden(
+            "You do not have project permissions for this action",
+            anyhow!("user {actor} does not own project {project_id}"),
+        ))
+    }
+}
+
+async fn load_project_row(pool: &PgPool, project_id: ProjectId) -> Result<Option<ProjectRow>> {
+    sqlx::query_as::<_, ProjectRow>(
         r#"
         SELECT
             p.id,
@@ -446,36 +534,32 @@ async fn load_accessible_project(
         FROM tasks.projects p
         WHERE p.id = $1
           AND p.deleted_at IS NULL
-          AND (
-              p.owner_user_id = $2
-              OR (
-                  p.owner_group_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auth.group_memberships gm
-                      JOIN auth.groups g
-                        ON g.id = gm.group_id
-                      JOIN auth.users u
-                        ON u.id = gm.user_id
-                      WHERE gm.group_id = p.owner_group_id
-                        AND gm.user_id = $2
-                        AND g.active = TRUE
-                        AND u.active = TRUE
-                        AND ($3::text[] IS NULL OR gm.role_name = ANY($3))
-                  )
-              )
-          )
         LIMIT 1
         "#,
     )
     .bind(project_id.0)
-    .bind(actor.0)
-    .bind(roles)
     .fetch_optional(pool)
     .await
-    .map_err(|err| db_err("Failed to query project", err))?;
+    .map_err(|err| db_err("Failed to query project", err))
+}
 
+async fn load_accessible_project(
+    pool: &PgPool,
+    actor: UserId,
+    project_id: ProjectId,
+    permission: &str,
+) -> Result<ProjectRow> {
+    let row = load_project_row(pool, project_id).await?;
     if let Some(row) = row {
+        ensure_project_owner_or_group_permission(
+            pool,
+            actor,
+            project_id,
+            row.owner_user_id,
+            row.owner_group_id,
+            permission,
+        )
+        .await?;
         Ok(row)
     } else if project_exists(pool, project_id).await? {
         Err(LibError::forbidden(
@@ -494,10 +578,9 @@ async fn load_accessible_milestone(
     pool: &PgPool,
     actor: UserId,
     milestone_id: MilestoneId,
-    allowed_roles: Option<&[String]>,
+    permission: &str,
 ) -> Result<MilestoneRow> {
-    let roles = role_filter(allowed_roles);
-    let row = sqlx::query_as::<_, MilestoneRow>(
+    let row = sqlx::query_as::<_, MilestoneAccessRow>(
         r#"
         SELECT
             m.id,
@@ -515,44 +598,52 @@ async fn load_accessible_milestone(
             m.repeat_schema,
             m.metadata,
             m.created_at,
-            m.updated_at
+            m.updated_at,
+            p.owner_user_id AS project_owner_user_id,
+            p.owner_group_id AS project_owner_group_id
         FROM tasks.milestones m
         JOIN tasks.projects p
           ON p.id = m.project_id
         WHERE m.id = $1
           AND m.deleted_at IS NULL
           AND p.deleted_at IS NULL
-          AND (
-              p.owner_user_id = $2
-              OR (
-                  p.owner_group_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auth.group_memberships gm
-                      JOIN auth.groups g
-                        ON g.id = gm.group_id
-                      JOIN auth.users u
-                        ON u.id = gm.user_id
-                      WHERE gm.group_id = p.owner_group_id
-                        AND gm.user_id = $2
-                        AND g.active = TRUE
-                        AND u.active = TRUE
-                        AND ($3::text[] IS NULL OR gm.role_name = ANY($3))
-                  )
-              )
-          )
         LIMIT 1
         "#,
     )
     .bind(milestone_id.0)
-    .bind(actor.0)
-    .bind(roles)
     .fetch_optional(pool)
     .await
     .map_err(|err| db_err("Failed to query milestone", err))?;
 
     if let Some(row) = row {
-        Ok(row)
+        ensure_project_owner_or_group_permission(
+            pool,
+            actor,
+            ProjectId(row.project_id),
+            row.project_owner_user_id,
+            row.project_owner_group_id,
+            permission,
+        )
+        .await?;
+
+        Ok(MilestoneRow {
+            id: row.id,
+            project_id: row.project_id,
+            milestone_type: row.milestone_type,
+            name: row.name,
+            description: row.description,
+            due_date: row.due_date,
+            start_date: row.start_date,
+            started: row.started,
+            completed: row.completed,
+            completed_date: row.completed_date,
+            repeat_interval_seconds: row.repeat_interval_seconds,
+            repeat_end: row.repeat_end,
+            repeat_schema: row.repeat_schema,
+            metadata: row.metadata,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     } else if milestone_exists(pool, milestone_id).await? {
         Err(LibError::forbidden(
             "You do not have access to this milestone",
@@ -566,13 +657,74 @@ async fn load_accessible_milestone(
     }
 }
 
+async fn get_task_project_permission_rows(
+    pool: &PgPool,
+    task_id: TaskId,
+) -> Result<Vec<TaskProjectPermissionRow>> {
+    sqlx::query_as::<_, TaskProjectPermissionRow>(
+        r#"
+        SELECT DISTINCT
+            p.id AS project_id,
+            p.owner_user_id,
+            p.owner_group_id
+        FROM tasks.task_projects tp
+        JOIN tasks.projects p
+          ON p.id = tp.project_id
+        WHERE tp.task_id = $1
+          AND p.deleted_at IS NULL
+        ORDER BY p.id ASC
+        "#,
+    )
+    .bind(task_id.0)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task projects for permissions", err))
+}
+
+async fn ensure_task_permission(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    author_user_id: Uuid,
+    permission: &str,
+) -> Result<()> {
+    if author_user_id == actor.0 {
+        return Ok(());
+    }
+
+    let project_rows = get_task_project_permission_rows(pool, task_id).await?;
+    for row in project_rows {
+        if row.owner_user_id == actor.0 {
+            return Ok(());
+        }
+        if let Some(group_id) = row.owner_group_id {
+            if group_has_permission(
+                pool,
+                actor,
+                GroupId(group_id),
+                permission,
+                Some(ProjectId(row.project_id)),
+                Some(task_id),
+            )
+            .await?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(LibError::forbidden(
+        "You do not have task permissions for this action",
+        anyhow!("user {actor} is missing task permission {permission} for task {task_id}"),
+    ))
+}
+
 async fn load_accessible_task(
     pool: &PgPool,
     actor: UserId,
     task_id: TaskId,
-    allowed_roles: Option<&[String]>,
+    permission: &str,
 ) -> Result<TaskRow> {
-    let roles = role_filter(allowed_roles);
     let row = sqlx::query_as::<_, TaskRow>(
         r#"
         SELECT
@@ -593,44 +745,16 @@ async fn load_accessible_task(
         FROM tasks.tasks t
         WHERE t.id = $1
           AND t.deleted_at IS NULL
-          AND EXISTS (
-              SELECT 1
-              FROM tasks.task_projects tp
-              JOIN tasks.projects p
-                ON p.id = tp.project_id
-              WHERE tp.task_id = t.id
-                AND p.deleted_at IS NULL
-                AND (
-                    p.owner_user_id = $2
-                    OR (
-                        p.owner_group_id IS NOT NULL
-                        AND EXISTS (
-                            SELECT 1
-                            FROM auth.group_memberships gm
-                            JOIN auth.groups g
-                              ON g.id = gm.group_id
-                            JOIN auth.users u
-                              ON u.id = gm.user_id
-                            WHERE gm.group_id = p.owner_group_id
-                              AND gm.user_id = $2
-                              AND g.active = TRUE
-                              AND u.active = TRUE
-                              AND ($3::text[] IS NULL OR gm.role_name = ANY($3))
-                        )
-                    )
-                )
-          )
         LIMIT 1
         "#,
     )
     .bind(task_id.0)
-    .bind(actor.0)
-    .bind(roles)
     .fetch_optional(pool)
     .await
     .map_err(|err| db_err("Failed to query task", err))?;
 
     if let Some(row) = row {
+        ensure_task_permission(pool, actor, task_id, row.author_user_id, permission).await?;
         Ok(row)
     } else if task_exists(pool, task_id).await? {
         Err(LibError::forbidden(
@@ -648,42 +772,43 @@ async fn load_accessible_task(
 async fn accessible_project_ids(
     pool: &PgPool,
     actor: UserId,
-    allowed_roles: Option<&[String]>,
+    permission: &str,
 ) -> Result<Vec<Uuid>> {
-    let roles = role_filter(allowed_roles);
-    let rows = sqlx::query_as::<_, (Uuid,)>(
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>)>(
         r#"
-        SELECT p.id
+        SELECT p.id, p.owner_user_id, p.owner_group_id
         FROM tasks.projects p
         WHERE p.deleted_at IS NULL
-          AND (
-              p.owner_user_id = $1
-              OR (
-                  p.owner_group_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auth.group_memberships gm
-                      JOIN auth.groups g
-                        ON g.id = gm.group_id
-                      JOIN auth.users u
-                        ON u.id = gm.user_id
-                      WHERE gm.group_id = p.owner_group_id
-                        AND gm.user_id = $1
-                        AND g.active = TRUE
-                        AND u.active = TRUE
-                        AND ($2::text[] IS NULL OR gm.role_name = ANY($2))
-                  )
-              )
-          )
+        ORDER BY p.id ASC
         "#,
     )
-    .bind(actor.0)
-    .bind(roles)
     .fetch_all(pool)
     .await
     .map_err(|err| db_err("Failed to query projects", err))?;
 
-    Ok(rows.into_iter().map(|row| row.0).collect())
+    let mut ids = Vec::with_capacity(rows.len());
+    for (project_id, owner_user_id, owner_group_id) in rows {
+        if owner_user_id == actor.0 {
+            ids.push(project_id);
+            continue;
+        }
+        if let Some(group_id) = owner_group_id {
+            if group_has_permission(
+                pool,
+                actor,
+                GroupId(group_id),
+                permission,
+                Some(ProjectId(project_id)),
+                None,
+            )
+            .await?
+            {
+                ids.push(project_id);
+            }
+        }
+    }
+
+    Ok(ids)
 }
 
 async fn get_task_project_ids(pool: &PgPool, task_id: TaskId) -> Result<Vec<ProjectId>> {
@@ -776,22 +901,27 @@ pub async fn create_project_with_roles(
     pool: &PgPool,
     actor: UserId,
     payload: CreateProjectPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Project> {
     let name = normalize_name(&payload.name, "Project")?;
     let description = normalize_description(payload.description);
     let owner_group_id = payload.owner_group_id;
 
     if let Some(group_id) = owner_group_id {
-        ensure_group_member(pool, actor, group_id, allowed_roles).await?;
+        ensure_group_permission_for_new_resource(pool, actor, group_id, perm::project_create())
+            .await?;
     }
 
-    get_graph(pool, actor, payload.task_state_graph_id)
-        .await
-        .map_err(LibError::from)?;
+    get_graph(
+        pool,
+        actor,
+        payload.task_state_graph_id,
+        perm::project_create(),
+    )
+    .await
+    .map_err(LibError::from)?;
 
     if let Some(task_graph_id) = payload.task_graph_id {
-        get_graph(pool, actor, task_graph_id)
+        get_graph(pool, actor, task_graph_id, perm::project_create())
             .await
             .map_err(LibError::from)?;
     }
@@ -829,16 +959,15 @@ pub async fn create_project_with_roles(
     .await
     .map_err(|err| db_err("Failed to create project", err))?;
 
-    get_project_with_roles(pool, actor, project_id, allowed_roles).await
+    get_project_with_roles(pool, actor, project_id).await
 }
 
 pub async fn get_project_with_roles(
     pool: &PgPool,
     actor: UserId,
     project_id: ProjectId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Project> {
-    let row = load_accessible_project(pool, actor, project_id, allowed_roles).await?;
+    let row = load_accessible_project(pool, actor, project_id, perm::project_read()).await?;
     Ok(to_project(row))
 }
 
@@ -847,10 +976,16 @@ pub async fn list_projects_with_roles(
     actor: UserId,
     page: u32,
     limit: u32,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Paged<ProjectSummary>> {
     let offset = (page.saturating_sub(1) as i64).saturating_mul(limit as i64);
-    let roles = role_filter(allowed_roles);
+    let allowed_project_ids = accessible_project_ids(pool, actor, perm::project_read()).await?;
+    if allowed_project_ids.is_empty() {
+        return Ok(Paged {
+            page,
+            limit,
+            items: Vec::new(),
+        });
+    }
 
     let rows = sqlx::query_as::<_, ProjectSummaryRow>(
         r#"
@@ -889,33 +1024,14 @@ pub async fn list_projects_with_roles(
         ) milestone_counts
           ON milestone_counts.project_id = p.id
         WHERE p.deleted_at IS NULL
-          AND (
-              p.owner_user_id = $1
-              OR (
-                  p.owner_group_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auth.group_memberships gm
-                      JOIN auth.groups g
-                        ON g.id = gm.group_id
-                      JOIN auth.users u
-                        ON u.id = gm.user_id
-                      WHERE gm.group_id = p.owner_group_id
-                        AND gm.user_id = $1
-                        AND g.active = TRUE
-                        AND u.active = TRUE
-                        AND ($4::text[] IS NULL OR gm.role_name = ANY($4))
-                  )
-              )
-          )
+          AND p.id = ANY($1)
         ORDER BY p.updated_at DESC, p.id DESC
         LIMIT $2 OFFSET $3
         "#,
     )
-    .bind(actor.0)
+    .bind(&allowed_project_ids)
     .bind(limit as i64)
     .bind(offset)
-    .bind(roles)
     .fetch_all(pool)
     .await
     .map_err(|err| db_err("Failed to list projects", err))?;
@@ -932,9 +1048,8 @@ pub async fn update_project_with_roles(
     actor: UserId,
     project_id: ProjectId,
     payload: UpdateProjectPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Project> {
-    let existing = load_accessible_project(pool, actor, project_id, allowed_roles).await?;
+    let existing = load_accessible_project(pool, actor, project_id, perm::project_update()).await?;
 
     let name = match payload.name {
         Some(name) => normalize_name(&name, "Project")?,
@@ -956,7 +1071,13 @@ pub async fn update_project_with_roles(
     };
 
     if let Some(group_id) = owner_group_id {
-        ensure_group_member(pool, actor, GroupId(group_id), allowed_roles).await?;
+        ensure_group_permission_for_new_resource(
+            pool,
+            actor,
+            GroupId(group_id),
+            perm::project_update(),
+        )
+        .await?;
     }
 
     let task_state_graph_id = payload
@@ -964,9 +1085,14 @@ pub async fn update_project_with_roles(
         .map(|id| id.0)
         .unwrap_or(existing.task_state_graph_id);
 
-    get_graph(pool, actor, GraphId(task_state_graph_id))
-        .await
-        .map_err(LibError::from)?;
+    get_graph(
+        pool,
+        actor,
+        GraphId(task_state_graph_id),
+        perm::project_update(),
+    )
+    .await
+    .map_err(LibError::from)?;
 
     let task_graph_id = if payload.clear_task_graph.unwrap_or(false) {
         None
@@ -978,7 +1104,7 @@ pub async fn update_project_with_roles(
     };
 
     if let Some(graph_id) = task_graph_id {
-        get_graph(pool, actor, GraphId(graph_id))
+        get_graph(pool, actor, GraphId(graph_id), perm::project_update())
             .await
             .map_err(LibError::from)?;
     }
@@ -1010,16 +1136,15 @@ pub async fn update_project_with_roles(
     .await
     .map_err(|err| db_err("Failed to update project", err))?;
 
-    get_project_with_roles(pool, actor, project_id, allowed_roles).await
+    get_project_with_roles(pool, actor, project_id).await
 }
 
 pub async fn delete_project_with_roles(
     pool: &PgPool,
     actor: UserId,
     project_id: ProjectId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<()> {
-    load_accessible_project(pool, actor, project_id, allowed_roles).await?;
+    load_accessible_project(pool, actor, project_id, perm::project_delete()).await?;
 
     sqlx::query(
         r#"
@@ -1043,9 +1168,8 @@ pub async fn create_milestone_with_roles(
     pool: &PgPool,
     actor: UserId,
     payload: CreateMilestonePayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Milestone> {
-    load_accessible_project(pool, actor, payload.project_id, allowed_roles).await?;
+    load_accessible_project(pool, actor, payload.project_id, perm::milestone_create()).await?;
 
     let name = normalize_name(&payload.name, "Milestone")?;
     let description = normalize_description(payload.description);
@@ -1109,16 +1233,15 @@ pub async fn create_milestone_with_roles(
     .await
     .map_err(|err| db_err("Failed to create milestone", err))?;
 
-    get_milestone_with_roles(pool, actor, milestone_id, allowed_roles).await
+    get_milestone_with_roles(pool, actor, milestone_id).await
 }
 
 pub async fn get_milestone_with_roles(
     pool: &PgPool,
     actor: UserId,
     milestone_id: MilestoneId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Milestone> {
-    let row = load_accessible_milestone(pool, actor, milestone_id, allowed_roles).await?;
+    let row = load_accessible_milestone(pool, actor, milestone_id, perm::milestone_read()).await?;
     to_milestone(row)
 }
 
@@ -1129,14 +1252,27 @@ pub async fn list_milestones_with_roles(
     completed: Option<bool>,
     page: u32,
     limit: u32,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Paged<Milestone>> {
+    let allowed_project_ids = accessible_project_ids(pool, actor, perm::milestone_read()).await?;
+    if allowed_project_ids.is_empty() {
+        return Ok(Paged {
+            page,
+            limit,
+            items: Vec::new(),
+        });
+    }
+
     if let Some(project_id) = project_id {
-        load_accessible_project(pool, actor, project_id, allowed_roles).await?;
+        if !allowed_project_ids.contains(&project_id.0) {
+            return Ok(Paged {
+                page,
+                limit,
+                items: Vec::new(),
+            });
+        }
     }
 
     let offset = (page.saturating_sub(1) as i64).saturating_mul(limit as i64);
-    let roles = role_filter(allowed_roles);
 
     let rows = sqlx::query_as::<_, MilestoneRow>(
         r#"
@@ -1162,37 +1298,18 @@ pub async fn list_milestones_with_roles(
           ON p.id = m.project_id
         WHERE m.deleted_at IS NULL
           AND p.deleted_at IS NULL
-          AND ($1::uuid IS NULL OR m.project_id = $1)
-          AND ($2::bool IS NULL OR m.completed = $2)
-          AND (
-              p.owner_user_id = $3
-              OR (
-                  p.owner_group_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM auth.group_memberships gm
-                      JOIN auth.groups g
-                        ON g.id = gm.group_id
-                      JOIN auth.users u
-                        ON u.id = gm.user_id
-                      WHERE gm.group_id = p.owner_group_id
-                        AND gm.user_id = $3
-                        AND g.active = TRUE
-                        AND u.active = TRUE
-                        AND ($6::text[] IS NULL OR gm.role_name = ANY($6))
-                  )
-              )
-          )
+          AND p.id = ANY($1)
+          AND ($2::uuid IS NULL OR m.project_id = $2)
+          AND ($3::bool IS NULL OR m.completed = $3)
         ORDER BY m.due_date ASC NULLS LAST, m.created_at DESC, m.id DESC
         LIMIT $4 OFFSET $5
         "#,
     )
+    .bind(&allowed_project_ids)
     .bind(project_id.map(|id| id.0))
     .bind(completed)
-    .bind(actor.0)
     .bind(limit as i64)
     .bind(offset)
-    .bind(roles)
     .fetch_all(pool)
     .await
     .map_err(|err| db_err("Failed to list milestones", err))?;
@@ -1210,9 +1327,9 @@ pub async fn update_milestone_with_roles(
     actor: UserId,
     milestone_id: MilestoneId,
     payload: UpdateMilestonePayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Milestone> {
-    let existing = load_accessible_milestone(pool, actor, milestone_id, allowed_roles).await?;
+    let existing =
+        load_accessible_milestone(pool, actor, milestone_id, perm::milestone_update()).await?;
 
     let milestone_type = payload
         .milestone_type
@@ -1312,16 +1429,15 @@ pub async fn update_milestone_with_roles(
     .await
     .map_err(|err| db_err("Failed to update milestone", err))?;
 
-    get_milestone_with_roles(pool, actor, milestone_id, allowed_roles).await
+    get_milestone_with_roles(pool, actor, milestone_id).await
 }
 
 pub async fn delete_milestone_with_roles(
     pool: &PgPool,
     actor: UserId,
     milestone_id: MilestoneId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<()> {
-    load_accessible_milestone(pool, actor, milestone_id, allowed_roles).await?;
+    load_accessible_milestone(pool, actor, milestone_id, perm::milestone_delete()).await?;
 
     sqlx::query(
         r#"
@@ -1345,9 +1461,8 @@ async fn entry_node_for_graph(
     pool: &PgPool,
     actor: UserId,
     graph_id: GraphId,
-    _allowed_roles: Option<&[String]>,
 ) -> Result<Option<GraphNodeId>> {
-    let graph = get_graph(pool, actor, graph_id)
+    let graph = get_graph(pool, actor, graph_id, perm::task_create())
         .await
         .map_err(LibError::from)?;
     Ok(graph.nodes.first().map(|node| node.id))
@@ -1357,9 +1472,8 @@ async fn validate_milestone_access_for_task(
     pool: &PgPool,
     actor: UserId,
     milestone_id: MilestoneId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<()> {
-    let _ = load_accessible_milestone(pool, actor, milestone_id, allowed_roles).await?;
+    let _ = load_accessible_milestone(pool, actor, milestone_id, perm::milestone_read()).await?;
     Ok(())
 }
 
@@ -1367,15 +1481,15 @@ pub async fn create_task_with_roles(
     pool: &PgPool,
     actor: UserId,
     payload: CreateTaskPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<TaskDetails> {
-    let project = load_accessible_project(pool, actor, payload.project_id, allowed_roles).await?;
+    let project =
+        load_accessible_project(pool, actor, payload.project_id, perm::task_create()).await?;
 
     let title = normalize_task_title(&payload.title)?;
     let description = normalize_description(payload.description);
 
     if let Some(milestone_id) = payload.milestone_id {
-        validate_milestone_access_for_task(pool, actor, milestone_id, allowed_roles).await?;
+        validate_milestone_access_for_task(pool, actor, milestone_id).await?;
     }
 
     let task_id = TaskId(Uuid::new_v4());
@@ -1386,7 +1500,7 @@ pub async fn create_task_with_roles(
     let state_graph_id = GraphId(project.task_state_graph_id);
     graph_assignments.push((
         state_graph_id,
-        entry_node_for_graph(pool, actor, state_graph_id, allowed_roles).await?,
+        entry_node_for_graph(pool, actor, state_graph_id).await?,
         0,
     ));
 
@@ -1395,7 +1509,7 @@ pub async fn create_task_with_roles(
         if task_graph_id != state_graph_id {
             graph_assignments.push((
                 task_graph_id,
-                entry_node_for_graph(pool, actor, task_graph_id, allowed_roles).await?,
+                entry_node_for_graph(pool, actor, task_graph_id).await?,
                 1,
             ));
         }
@@ -1515,16 +1629,15 @@ pub async fn create_task_with_roles(
         .await
         .map_err(|err| db_err("Failed to commit transaction", err))?;
 
-    get_task_with_roles(pool, actor, task_id, allowed_roles).await
+    get_task_with_roles(pool, actor, task_id).await
 }
 
 pub async fn get_task_with_roles(
     pool: &PgPool,
     actor: UserId,
     task_id: TaskId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<TaskDetails> {
-    let row = load_accessible_task(pool, actor, task_id, allowed_roles).await?;
+    let row = load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
     let task = to_task(row)?;
     let project_ids = get_task_project_ids(pool, task_id).await?;
     let graph_assignments = get_task_graph_assignments(pool, task_id).await?;
@@ -1549,26 +1662,8 @@ pub async fn list_tasks_with_roles(
     archived: Option<bool>,
     page: u32,
     limit: u32,
-    allowed_roles: Option<&[String]>,
 ) -> Result<Paged<Task>> {
-    let allowed_project_ids = accessible_project_ids(pool, actor, allowed_roles).await?;
-    if allowed_project_ids.is_empty() {
-        return Ok(Paged {
-            page,
-            limit,
-            items: Vec::new(),
-        });
-    }
-
-    if let Some(project_id) = project_id {
-        if !allowed_project_ids.contains(&project_id.0) {
-            return Ok(Paged {
-                page,
-                limit,
-                items: Vec::new(),
-            });
-        }
-    }
+    let allowed_project_ids = accessible_project_ids(pool, actor, perm::task_read()).await?;
 
     let offset = (page.saturating_sub(1) as i64).saturating_mul(limit as i64);
 
@@ -1591,21 +1686,33 @@ pub async fn list_tasks_with_roles(
             t.updated_at
         FROM tasks.tasks t
         WHERE t.deleted_at IS NULL
-          AND EXISTS (
-              SELECT 1
-              FROM tasks.task_projects tp
-              WHERE tp.task_id = t.id
-                AND tp.project_id = ANY($1)
-                AND ($2::uuid IS NULL OR tp.project_id = $2)
+          AND (
+              t.author_user_id = $2
+              OR EXISTS (
+                  SELECT 1
+                  FROM tasks.task_projects tp
+                  WHERE tp.task_id = t.id
+                    AND tp.project_id = ANY($1)
+              )
           )
-          AND ($3::uuid IS NULL OR t.assignee_user_id = $3)
-          AND ($4::text IS NULL OR t.state = $4)
-          AND ($5::bool IS NULL OR t.archived = $5)
+          AND (
+              $3::uuid IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM tasks.task_projects tp2
+                  WHERE tp2.task_id = t.id
+                    AND tp2.project_id = $3
+              )
+          )
+          AND ($4::uuid IS NULL OR t.assignee_user_id = $4)
+          AND ($5::text IS NULL OR t.state = $5)
+          AND ($6::bool IS NULL OR t.archived = $6)
         ORDER BY t.updated_at DESC, t.id DESC
-        LIMIT $6 OFFSET $7
+        LIMIT $7 OFFSET $8
         "#,
     )
     .bind(&allowed_project_ids)
+    .bind(actor.0)
     .bind(project_id.map(|id| id.0))
     .bind(assignee_user_id.map(|id| id.0))
     .bind(state.map(|value| value.as_str()))
@@ -1629,9 +1736,8 @@ pub async fn update_task_with_roles(
     actor: UserId,
     task_id: TaskId,
     payload: UpdateTaskPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<TaskDetails> {
-    let existing = load_accessible_task(pool, actor, task_id, allowed_roles).await?;
+    let existing = load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
 
     let title = payload
         .title
@@ -1672,8 +1778,7 @@ pub async fn update_task_with_roles(
     };
 
     if let Some(milestone_id) = milestone_id {
-        validate_milestone_access_for_task(pool, actor, MilestoneId(milestone_id), allowed_roles)
-            .await?;
+        validate_milestone_access_for_task(pool, actor, MilestoneId(milestone_id)).await?;
     }
 
     let state = payload
@@ -1716,16 +1821,11 @@ pub async fn update_task_with_roles(
     .await
     .map_err(|err| db_err("Failed to update task", err))?;
 
-    get_task_with_roles(pool, actor, task_id, allowed_roles).await
+    get_task_with_roles(pool, actor, task_id).await
 }
 
-pub async fn delete_task_with_roles(
-    pool: &PgPool,
-    actor: UserId,
-    task_id: TaskId,
-    allowed_roles: Option<&[String]>,
-) -> Result<()> {
-    load_accessible_task(pool, actor, task_id, allowed_roles).await?;
+pub async fn delete_task_with_roles(pool: &PgPool, actor: UserId, task_id: TaskId) -> Result<()> {
+    load_accessible_task(pool, actor, task_id, perm::task_delete()).await?;
 
     sqlx::query(
         r#"
@@ -1750,10 +1850,9 @@ pub async fn create_task_link_with_roles(
     actor: UserId,
     task_id: TaskId,
     payload: CreateTaskLinkPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<TaskLink> {
-    load_accessible_task(pool, actor, task_id, allowed_roles).await?;
-    load_accessible_task(pool, actor, payload.other_task_id, allowed_roles).await?;
+    load_accessible_task(pool, actor, task_id, perm::task_link()).await?;
+    load_accessible_task(pool, actor, payload.other_task_id, perm::task_link()).await?;
 
     if task_id == payload.other_task_id {
         return Err(LibError::invalid(
@@ -1810,10 +1909,9 @@ pub async fn delete_task_links_with_roles(
     actor: UserId,
     task_id: TaskId,
     other_task_id: TaskId,
-    allowed_roles: Option<&[String]>,
 ) -> Result<()> {
-    load_accessible_task(pool, actor, task_id, allowed_roles).await?;
-    load_accessible_task(pool, actor, other_task_id, allowed_roles).await?;
+    load_accessible_task(pool, actor, task_id, perm::task_link()).await?;
+    load_accessible_task(pool, actor, other_task_id, perm::task_link()).await?;
 
     sqlx::query(
         r#"
@@ -1836,9 +1934,8 @@ pub async fn transition_task_with_roles(
     actor: UserId,
     task_id: TaskId,
     payload: TransitionTaskPayload,
-    allowed_roles: Option<&[String]>,
 ) -> Result<TaskDetails> {
-    load_accessible_task(pool, actor, task_id, allowed_roles).await?;
+    load_accessible_task(pool, actor, task_id, perm::task_transition()).await?;
 
     let assignments = get_task_graph_assignments(pool, task_id).await?;
     let graph_id = payload
@@ -1851,7 +1948,7 @@ pub async fn transition_task_with_roles(
         )
     })?;
 
-    let graph = get_graph(pool, actor, graph_id)
+    let graph = get_graph(pool, actor, graph_id, perm::task_transition())
         .await
         .map_err(LibError::from)?;
 
@@ -1892,5 +1989,5 @@ pub async fn transition_task_with_roles(
     .await
     .map_err(|err| db_err("Failed to transition task", err))?;
 
-    get_task_with_roles(pool, actor, task_id, allowed_roles).await
+    get_task_with_roles(pool, actor, task_id).await
 }
