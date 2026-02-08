@@ -2588,7 +2588,7 @@ dependencies = [
 [[package]]
 name = "subseq_graph"
 version = "0.1.0"
-source = "git+https://github.com/subseq-io/subseq_graph.git?branch=main#09461dbf9628ce84bb6a2aa9f0128fe9677d315a"
+source = "git+https://github.com/subseq-io/subseq_graph.git?branch=main#a8a6c0b8c1d6164932a468f90d50ba3a7a627132"
 dependencies = [
  "anyhow",
  "chrono",
