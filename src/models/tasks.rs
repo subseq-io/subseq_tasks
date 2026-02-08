@@ -4,7 +4,7 @@ use serde_json::Value;
 use subseq_auth::user_id::UserId;
 use subseq_graph::models::{GraphId, GraphNodeId};
 
-use super::{MilestoneId, ProjectId, TaskId, TaskLinkType, TaskState};
+use super::{MilestoneId, ProjectId, TaskCommentId, TaskId, TaskLinkType, TaskLogId, TaskState};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +20,9 @@ pub struct Task {
     pub milestone_id: Option<MilestoneId>,
     pub state: TaskState,
     pub archived: bool,
+    pub completed_by_user_id: Option<UserId>,
+    pub completed_at: Option<NaiveDateTime>,
+    pub rejected_reason: Option<String>,
     pub metadata: Value,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -40,6 +43,32 @@ pub struct TaskLink {
     pub task_from_id: TaskId,
     pub task_to_id: TaskId,
     pub link_type: TaskLinkType,
+    pub subtask_parent_state: Option<TaskState>,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskComment {
+    pub id: TaskCommentId,
+    pub task_id: TaskId,
+    pub author_user_id: UserId,
+    pub body: String,
+    pub metadata: Value,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskLogEntry {
+    pub id: TaskLogId,
+    pub task_id: TaskId,
+    pub actor_user_id: UserId,
+    pub action: String,
+    pub from_state: Option<TaskState>,
+    pub to_state: Option<TaskState>,
+    pub details: Value,
     pub created_at: NaiveDateTime,
 }
 
@@ -51,6 +80,8 @@ pub struct TaskDetails {
     pub graph_assignments: Vec<TaskGraphAssignment>,
     pub links_out: Vec<TaskLink>,
     pub links_in: Vec<TaskLink>,
+    pub comments: Vec<TaskComment>,
+    pub log: Vec<TaskLogEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,8 +137,18 @@ pub struct UpdateTaskPayload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransitionTaskPayload {
-    pub graph_id: Option<GraphId>,
-    pub node_id: GraphNodeId,
+    pub to_state: TaskState,
+    pub when: Option<DateTime<Utc>>,
+    pub assigned_to_user_id: Option<UserId>,
+    pub deferral_reason: Option<String>,
+    pub cant_do_reason: Option<String>,
+    pub estimated_time_to_complete: Option<String>,
+    pub work_log_details: Option<String>,
+    pub feedback: Option<String>,
+    pub done_by_user_id: Option<UserId>,
+    pub done_at: Option<DateTime<Utc>>,
+    pub rejected_reason: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,4 +156,12 @@ pub struct TransitionTaskPayload {
 pub struct CreateTaskLinkPayload {
     pub other_task_id: TaskId,
     pub link_type: TaskLinkType,
+    pub subtask_parent_state: Option<TaskState>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskCommentPayload {
+    pub body: String,
+    pub metadata: Option<Value>,
 }

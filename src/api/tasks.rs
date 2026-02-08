@@ -9,8 +9,8 @@ use subseq_auth::prelude::AuthenticatedUser;
 
 use crate::db;
 use crate::models::{
-    CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery, TaskId, TransitionTaskPayload,
-    UpdateTaskPayload,
+    CreateTaskCommentPayload, CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery, TaskId,
+    TransitionTaskPayload, UpdateTaskPayload,
 };
 
 use super::{AppError, TasksApp};
@@ -101,6 +101,44 @@ where
     Ok((StatusCode::CREATED, Json(link)))
 }
 
+async fn create_task_comment_handler<S>(
+    State(app): State<S>,
+    auth_user: AuthenticatedUser,
+    Path(task_id): Path<TaskId>,
+    Json(payload): Json<CreateTaskCommentPayload>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: TasksApp + Clone + Send + Sync + 'static,
+{
+    let comment =
+        db::create_task_comment_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    Ok((StatusCode::CREATED, Json(comment)))
+}
+
+async fn list_task_comments_handler<S>(
+    State(app): State<S>,
+    auth_user: AuthenticatedUser,
+    Path(task_id): Path<TaskId>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: TasksApp + Clone + Send + Sync + 'static,
+{
+    let comments = db::list_task_comments_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    Ok(Json(comments))
+}
+
+async fn get_task_log_handler<S>(
+    State(app): State<S>,
+    auth_user: AuthenticatedUser,
+    Path(task_id): Path<TaskId>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: TasksApp + Clone + Send + Sync + 'static,
+{
+    let log = db::get_task_log_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    Ok(Json(log))
+}
+
 async fn delete_task_links_handler<S>(
     State(app): State<S>,
     auth_user: AuthenticatedUser,
@@ -144,9 +182,14 @@ where
         )
         .route("/task/{task_id}/link", post(create_task_link_handler::<S>))
         .route(
+            "/task/{task_id}/comments",
+            get(list_task_comments_handler::<S>).post(create_task_comment_handler::<S>),
+        )
+        .route(
             "/task/{task_id}/link/{other_task_id}",
             delete(delete_task_links_handler::<S>),
         )
+        .route("/task/{task_id}/log", get(get_task_log_handler::<S>))
         .route(
             "/task/{task_id}/transition",
             post(transition_task_handler::<S>),

@@ -29,7 +29,7 @@ The following hard-coded role names are defined in `/Users/teague/Subsequent/bac
 - `task_update`: update task fields.
 - `task_delete`: soft-delete tasks.
 - `task_link`: create/delete task links.
-- `task_transition`: change a task graph node assignment.
+- `task_transition`: move a task through the workflow state machine.
 
 ## Access Behavior
 
@@ -43,6 +43,31 @@ Write implies read for each domain boundary:
 
 Task owners always have read/write access to their own tasks, even when group-role checks would otherwise deny access.
 
+## Task Workflow
+
+The task lifecycle is state-machine based:
+
+- `open -> todo`
+- `todo -> assigned | open | in_progress`
+- `assigned -> in_progress | todo`
+- `in_progress -> todo | acceptance`
+- `acceptance -> in_progress`
+- Any non-terminal state can short-circuit to `done` or `rejected`.
+
+Transitions apply structured side effects:
+
+- Assignment transitions set task assignee fields.
+- Done transitions set completion fields (`completed_by_user_id`, `completed_at`).
+- Rejected transitions set `rejected_reason`.
+- Transition-only context (for example feedback or work-log details) is captured in task comments when provided.
+- Every task mutation and transition is appended to `tasks.task_log`.
+
+## Subtasks By Parent State
+
+`tasks.task_links` supports `subtask_parent_state` for `subtask_of` links so subtasks can be tied to a specific parent workflow state.
+
+For non-`subtask_of` links, `subtask_parent_state` must be null.
+
 ## Task Graph Permission Coupling
 
 When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.
@@ -53,7 +78,6 @@ This applies to:
 - Project read/list responses (graph IDs are part of the response model).
 - Task creation entry-node resolution.
 - Task details reads that include graph assignments.
-- Task transitions that validate target graph nodes.
 
 ## Permission Helpers
 

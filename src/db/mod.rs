@@ -15,9 +15,10 @@ use subseq_graph::permissions as graph_perm;
 
 use crate::error::{ErrorKind, LibError, Result};
 use crate::models::{
-    CreateMilestonePayload, CreateProjectPayload, CreateTaskLinkPayload, CreateTaskPayload,
-    Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId, ProjectSummary, RepeatSchema,
-    Task, TaskDetails, TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskState,
+    CreateMilestonePayload, CreateProjectPayload, CreateTaskCommentPayload, CreateTaskLinkPayload,
+    CreateTaskPayload, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
+    ProjectSummary, RepeatSchema, Task, TaskComment, TaskCommentId, TaskDetails,
+    TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskState,
     TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
 };
 use crate::permissions as perm;
@@ -120,6 +121,9 @@ struct TaskRow {
     milestone_id: Option<Uuid>,
     state: String,
     archived: bool,
+    completed_by_user_id: Option<Uuid>,
+    completed_at: Option<chrono::NaiveDateTime>,
+    rejected_reason: Option<String>,
     metadata: serde_json::Value,
     created_at: chrono::NaiveDateTime,
     updated_at: chrono::NaiveDateTime,
@@ -130,6 +134,30 @@ struct TaskLinkRow {
     task_from_id: Uuid,
     task_to_id: Uuid,
     link_type: String,
+    subtask_parent_state: Option<String>,
+    created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct TaskCommentRow {
+    id: Uuid,
+    task_id: Uuid,
+    author_user_id: Uuid,
+    body: String,
+    metadata: serde_json::Value,
+    created_at: chrono::NaiveDateTime,
+    updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct TaskLogRow {
+    id: Uuid,
+    task_id: Uuid,
+    actor_user_id: Uuid,
+    action: String,
+    from_state: Option<String>,
+    to_state: Option<String>,
+    details: serde_json::Value,
     created_at: chrono::NaiveDateTime,
 }
 
@@ -329,6 +357,9 @@ fn to_task(row: TaskRow) -> Result<Task> {
         milestone_id: row.milestone_id.map(MilestoneId),
         state: task_state_from_row(&row.state)?,
         archived: row.archived,
+        completed_by_user_id: row.completed_by_user_id.map(UserId),
+        completed_at: row.completed_at,
+        rejected_reason: row.rejected_reason,
         metadata: row.metadata,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -349,6 +380,44 @@ fn to_task_link(row: TaskLinkRow) -> Result<TaskLink> {
         task_from_id: TaskId(row.task_from_id),
         task_to_id: TaskId(row.task_to_id),
         link_type: task_link_type_from_row(&row.link_type)?,
+        subtask_parent_state: row
+            .subtask_parent_state
+            .as_deref()
+            .map(task_state_from_row)
+            .transpose()?,
+        created_at: row.created_at,
+    })
+}
+
+fn to_task_comment(row: TaskCommentRow) -> TaskComment {
+    TaskComment {
+        id: TaskCommentId(row.id),
+        task_id: TaskId(row.task_id),
+        author_user_id: UserId(row.author_user_id),
+        body: row.body,
+        metadata: row.metadata,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+fn to_task_log(row: TaskLogRow) -> Result<TaskLogEntry> {
+    Ok(TaskLogEntry {
+        id: TaskLogId(row.id),
+        task_id: TaskId(row.task_id),
+        actor_user_id: UserId(row.actor_user_id),
+        action: row.action,
+        from_state: row
+            .from_state
+            .as_deref()
+            .map(task_state_from_row)
+            .transpose()?,
+        to_state: row
+            .to_state
+            .as_deref()
+            .map(task_state_from_row)
+            .transpose()?,
+        details: row.details,
         created_at: row.created_at,
     })
 }
@@ -786,6 +855,9 @@ async fn load_accessible_task(
             t.milestone_id,
             t.state,
             t.archived,
+            t.completed_by_user_id,
+            t.completed_at,
+            t.rejected_reason,
             t.metadata,
             t.created_at,
             t.updated_at
@@ -909,6 +981,7 @@ async fn get_task_links_out(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskLi
             task_from_id,
             task_to_id,
             link_type,
+            subtask_parent_state,
             created_at
         FROM tasks.task_links
         WHERE task_from_id = $1
@@ -930,6 +1003,7 @@ async fn get_task_links_in(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskLin
             task_from_id,
             task_to_id,
             link_type,
+            subtask_parent_state,
             created_at
         FROM tasks.task_links
         WHERE task_to_id = $1
@@ -942,6 +1016,145 @@ async fn get_task_links_in(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskLin
     .map_err(|err| db_err("Failed to query incoming task links", err))?;
 
     rows.into_iter().map(to_task_link).collect()
+}
+
+async fn append_task_log(
+    pool: &PgPool,
+    task_id: TaskId,
+    actor: UserId,
+    action: &str,
+    from_state: Option<TaskState>,
+    to_state: Option<TaskState>,
+    details: serde_json::Value,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO tasks.task_log (
+            id,
+            task_id,
+            actor_user_id,
+            action,
+            from_state,
+            to_state,
+            details
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(task_id.0)
+    .bind(actor.0)
+    .bind(action)
+    .bind(from_state.map(|state| state.as_str().to_string()))
+    .bind(to_state.map(|state| state.as_str().to_string()))
+    .bind(details)
+    .execute(pool)
+    .await
+    .map_err(|err| db_err("Failed to append task log", err))?;
+
+    Ok(())
+}
+
+async fn insert_task_comment(
+    pool: &PgPool,
+    task_id: TaskId,
+    actor: UserId,
+    body: String,
+    metadata: serde_json::Value,
+) -> Result<TaskComment> {
+    let row = sqlx::query_as::<_, TaskCommentRow>(
+        r#"
+        INSERT INTO tasks.task_comments (
+            id,
+            task_id,
+            author_user_id,
+            body,
+            metadata
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING
+            id,
+            task_id,
+            author_user_id,
+            body,
+            metadata,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(task_id.0)
+    .bind(actor.0)
+    .bind(body)
+    .bind(metadata)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| db_err("Failed to create task comment", err))?;
+
+    Ok(to_task_comment(row))
+}
+
+async fn get_task_comments(pool: &PgPool, task_id: TaskId, limit: i64) -> Result<Vec<TaskComment>> {
+    let rows = sqlx::query_as::<_, TaskCommentRow>(
+        r#"
+        SELECT
+            id,
+            task_id,
+            author_user_id,
+            body,
+            metadata,
+            created_at,
+            updated_at
+        FROM tasks.task_comments
+        WHERE task_id = $1
+          AND deleted_at IS NULL
+        ORDER BY created_at ASC, id ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task comments", err))?;
+
+    Ok(rows.into_iter().map(to_task_comment).collect())
+}
+
+async fn get_task_log_entries(
+    pool: &PgPool,
+    task_id: TaskId,
+    limit: i64,
+) -> Result<Vec<TaskLogEntry>> {
+    let rows = sqlx::query_as::<_, TaskLogRow>(
+        r#"
+        SELECT
+            id,
+            task_id,
+            actor_user_id,
+            action,
+            from_state,
+            to_state,
+            details,
+            created_at
+        FROM tasks.task_log
+        WHERE task_id = $1
+        ORDER BY created_at ASC, id ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task log", err))?;
+
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        entries.push(to_task_log(row)?);
+    }
+
+    Ok(entries)
 }
 
 mod milestones;
@@ -957,7 +1170,8 @@ pub use projects::{
     list_projects_with_roles, update_project_with_roles,
 };
 pub use tasks::{
-    create_task_link_with_roles, create_task_with_roles, delete_task_links_with_roles,
-    delete_task_with_roles, get_task_with_roles, list_tasks_with_roles, transition_task_with_roles,
-    update_task_with_roles,
+    create_task_comment_with_roles, create_task_link_with_roles, create_task_with_roles,
+    delete_task_links_with_roles, delete_task_with_roles, get_task_log_with_roles,
+    get_task_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
+    transition_task_with_roles, update_task_with_roles,
 };

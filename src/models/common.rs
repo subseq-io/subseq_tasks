@@ -83,24 +83,36 @@ pub enum RepeatSchema {
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
     Open,
+    Todo,
+    Assigned,
     InProgress,
-    Closed,
+    Acceptance,
+    Done,
+    Rejected,
 }
 
 impl TaskState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
+            Self::Todo => "todo",
+            Self::Assigned => "assigned",
             Self::InProgress => "in_progress",
-            Self::Closed => "closed",
+            Self::Acceptance => "acceptance",
+            Self::Done => "done",
+            Self::Rejected => "rejected",
         }
     }
 
     pub fn from_db_value(value: &str) -> Option<Self> {
         match value {
             "open" => Some(Self::Open),
+            "todo" => Some(Self::Todo),
+            "assigned" => Some(Self::Assigned),
             "in_progress" => Some(Self::InProgress),
-            "closed" => Some(Self::Closed),
+            "acceptance" => Some(Self::Acceptance),
+            "done" => Some(Self::Done),
+            "rejected" => Some(Self::Rejected),
             _ => None,
         }
     }

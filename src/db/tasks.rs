@@ -1,4 +1,116 @@
+use chrono::Utc;
+use serde_json::json;
+
 use super::*;
+
+const TASK_DETAILS_LIMIT: i64 = 200;
+
+fn normalize_free_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn transition_allowed(from: TaskState, to: TaskState) -> bool {
+    if from == to {
+        return false;
+    }
+
+    if matches!(to, TaskState::Done | TaskState::Rejected)
+        && !matches!(from, TaskState::Done | TaskState::Rejected)
+    {
+        return true;
+    }
+
+    match from {
+        TaskState::Open => matches!(to, TaskState::Todo),
+        TaskState::Todo => matches!(
+            to,
+            TaskState::Assigned | TaskState::Open | TaskState::InProgress
+        ),
+        TaskState::Assigned => matches!(to, TaskState::InProgress | TaskState::Todo),
+        TaskState::InProgress => matches!(to, TaskState::Todo | TaskState::Acceptance),
+        TaskState::Acceptance => matches!(to, TaskState::InProgress),
+        TaskState::Done | TaskState::Rejected => false,
+    }
+}
+
+fn build_transition_comment(
+    from_state: TaskState,
+    to_state: TaskState,
+    payload: &TransitionTaskPayload,
+) -> Option<String> {
+    let explicit_comment = normalize_free_text(payload.comment.clone());
+    let mut context_lines = Vec::new();
+
+    match (from_state, to_state) {
+        (TaskState::Open, TaskState::Todo) => {
+            if let Some(when) = payload.when {
+                context_lines.push(format!("Moved to todo at {}", when.to_rfc3339()));
+            }
+        }
+        (TaskState::Todo, TaskState::Open) => {
+            if let Some(reason) = normalize_free_text(payload.deferral_reason.clone()) {
+                context_lines.push(format!("Deferral reason: {reason}"));
+            }
+        }
+        (TaskState::Assigned, TaskState::Todo) | (TaskState::InProgress, TaskState::Todo) => {
+            if let Some(reason) = normalize_free_text(payload.cant_do_reason.clone()) {
+                context_lines.push(format!("Can't do reason: {reason}"));
+            }
+        }
+        (TaskState::Assigned, TaskState::InProgress) => {
+            if let Some(estimate) = normalize_free_text(payload.estimated_time_to_complete.clone())
+            {
+                context_lines.push(format!("Estimated time-to-complete: {estimate}"));
+            }
+        }
+        (TaskState::InProgress, TaskState::Acceptance) => {
+            if let Some(details) = normalize_free_text(payload.work_log_details.clone()) {
+                context_lines.push(format!("Work log details: {details}"));
+            }
+        }
+        (TaskState::Acceptance, TaskState::InProgress) => {
+            if let Some(feedback) = normalize_free_text(payload.feedback.clone()) {
+                context_lines.push(format!("Feedback: {feedback}"));
+            }
+        }
+        _ => {}
+    }
+
+    match (explicit_comment, context_lines.is_empty()) {
+        (Some(comment), true) => Some(comment),
+        (Some(comment), false) => Some(format!("{comment}\n\n{}", context_lines.join("\n"))),
+        (None, false) => Some(context_lines.join("\n")),
+        (None, true) => None,
+    }
+}
+
+fn transition_details(
+    from_state: TaskState,
+    to_state: TaskState,
+    payload: &TransitionTaskPayload,
+    assignee_user_id: Option<Uuid>,
+    completed_by_user_id: Option<Uuid>,
+    completed_at: Option<chrono::NaiveDateTime>,
+    rejected_reason: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "fromState": from_state.as_str(),
+        "toState": to_state.as_str(),
+        "when": payload.when.map(|value| value.to_rfc3339()),
+        "assignedToUserId": assignee_user_id,
+        "deferralReason": normalize_free_text(payload.deferral_reason.clone()),
+        "cantDoReason": normalize_free_text(payload.cant_do_reason.clone()),
+        "estimatedTimeToComplete": normalize_free_text(payload.estimated_time_to_complete.clone()),
+        "workLogDetails": normalize_free_text(payload.work_log_details.clone()),
+        "feedback": normalize_free_text(payload.feedback.clone()),
+        "doneByUserId": completed_by_user_id,
+        "doneAt": completed_at,
+        "rejectedReason": rejected_reason,
+        "comment": normalize_free_text(payload.comment.clone()),
+    })
+}
 
 async fn entry_node_for_graph(
     pool: &PgPool,
@@ -28,6 +140,15 @@ pub async fn create_task_with_roles(
     let project =
         load_accessible_project(pool, actor, payload.project_id, perm::task_create()).await?;
 
+    if let Some(state) = payload.state
+        && state != TaskState::Open
+    {
+        return Err(LibError::invalid(
+            "Task must start in the open state",
+            anyhow!("initial state {} is not allowed", state.as_str()),
+        ));
+    }
+
     let title = normalize_task_title(&payload.title)?;
     let description = normalize_description(payload.description);
 
@@ -36,7 +157,7 @@ pub async fn create_task_with_roles(
     }
 
     let task_id = TaskId(Uuid::new_v4());
-    let state = payload.state.unwrap_or(TaskState::Open);
+    let state = TaskState::Open;
     let metadata = payload.metadata.unwrap_or_else(|| json!({}));
 
     let mut graph_assignments: Vec<(GraphId, Option<GraphNodeId>, i32)> = Vec::new();
@@ -172,6 +293,21 @@ pub async fn create_task_with_roles(
         .await
         .map_err(|err| db_err("Failed to commit transaction", err))?;
 
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_created",
+        None,
+        Some(TaskState::Open),
+        json!({
+            "projectId": payload.project_id.0,
+            "milestoneId": payload.milestone_id.map(|id| id.0),
+            "priority": payload.priority.unwrap_or(0),
+        }),
+    )
+    .await?;
+
     get_task_with_roles(pool, actor, task_id).await
 }
 
@@ -187,6 +323,8 @@ pub async fn get_task_with_roles(
     ensure_task_assignment_graph_access(pool, actor, &graph_assignments).await?;
     let links_out = get_task_links_out(pool, task_id).await?;
     let links_in = get_task_links_in(pool, task_id).await?;
+    let comments = get_task_comments(pool, task_id, TASK_DETAILS_LIMIT).await?;
+    let log = get_task_log_entries(pool, task_id, TASK_DETAILS_LIMIT).await?;
 
     Ok(TaskDetails {
         task,
@@ -194,6 +332,8 @@ pub async fn get_task_with_roles(
         graph_assignments,
         links_out,
         links_in,
+        comments,
+        log,
     })
 }
 
@@ -225,6 +365,9 @@ pub async fn list_tasks_with_roles(
             t.milestone_id,
             t.state,
             t.archived,
+            t.completed_by_user_id,
+            t.completed_at,
+            t.rejected_reason,
             t.metadata,
             t.created_at,
             t.updated_at
@@ -283,16 +426,23 @@ pub async fn update_task_with_roles(
 ) -> Result<TaskDetails> {
     let existing = load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
 
+    if payload.state.is_some() {
+        return Err(LibError::invalid(
+            "State updates must use the transition endpoint",
+            anyhow!("task update payload attempted direct state mutation"),
+        ));
+    }
+
     let title = payload
         .title
         .map(|value| normalize_task_title(&value))
         .transpose()?
-        .unwrap_or(existing.title);
+        .unwrap_or_else(|| existing.title.clone());
 
     let description = payload
         .description
         .map(|value| value.trim().to_string())
-        .unwrap_or(existing.description);
+        .unwrap_or_else(|| existing.description.clone());
 
     let assignee_user_id = if payload.clear_assignee.unwrap_or(false) {
         None
@@ -325,13 +475,10 @@ pub async fn update_task_with_roles(
         validate_milestone_access_for_task(pool, actor, MilestoneId(milestone_id)).await?;
     }
 
-    let state = payload
-        .state
-        .map(|value| value.as_str().to_string())
-        .unwrap_or(existing.state);
-
     let archived = payload.archived.unwrap_or(existing.archived);
-    let metadata = payload.metadata.unwrap_or(existing.metadata);
+    let metadata = payload
+        .metadata
+        .unwrap_or_else(|| existing.metadata.clone());
 
     sqlx::query(
         r#"
@@ -343,33 +490,72 @@ pub async fn update_task_with_roles(
             priority = $4,
             due_date = $5,
             milestone_id = $6,
-            state = $7,
-            archived = $8,
-            metadata = $9,
+            archived = $7,
+            metadata = $8,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = $10
+        WHERE id = $9
           AND deleted_at IS NULL
         "#,
     )
-    .bind(title)
-    .bind(description)
+    .bind(&title)
+    .bind(&description)
     .bind(assignee_user_id)
     .bind(payload.priority.unwrap_or(existing.priority))
     .bind(due_date)
     .bind(milestone_id)
-    .bind(state)
     .bind(archived)
-    .bind(metadata)
+    .bind(&metadata)
     .bind(task_id.0)
     .execute(pool)
     .await
     .map_err(|err| db_err("Failed to update task", err))?;
 
+    let mut changed_fields = serde_json::Map::new();
+    if title != existing.title {
+        changed_fields.insert("title".to_string(), json!(title));
+    }
+    if description != existing.description {
+        changed_fields.insert("description".to_string(), json!(description));
+    }
+    if assignee_user_id != existing.assignee_user_id {
+        changed_fields.insert("assigneeUserId".to_string(), json!(assignee_user_id));
+    }
+    if payload.priority.unwrap_or(existing.priority) != existing.priority {
+        changed_fields.insert(
+            "priority".to_string(),
+            json!(payload.priority.unwrap_or(existing.priority)),
+        );
+    }
+    if due_date != existing.due_date {
+        changed_fields.insert("dueDate".to_string(), json!(due_date));
+    }
+    if milestone_id != existing.milestone_id {
+        changed_fields.insert("milestoneId".to_string(), json!(milestone_id));
+    }
+    if archived != existing.archived {
+        changed_fields.insert("archived".to_string(), json!(archived));
+    }
+    if metadata != existing.metadata {
+        changed_fields.insert("metadata".to_string(), metadata);
+    }
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_updated",
+        None,
+        None,
+        json!({ "changedFields": changed_fields }),
+    )
+    .await?;
+
     get_task_with_roles(pool, actor, task_id).await
 }
 
 pub async fn delete_task_with_roles(pool: &PgPool, actor: UserId, task_id: TaskId) -> Result<()> {
-    load_accessible_task(pool, actor, task_id, perm::task_delete()).await?;
+    let existing = load_accessible_task(pool, actor, task_id, perm::task_delete()).await?;
+    let from_state = task_state_from_row(&existing.state)?;
 
     sqlx::query(
         r#"
@@ -385,6 +571,17 @@ pub async fn delete_task_with_roles(pool: &PgPool, actor: UserId, task_id: TaskI
     .execute(pool)
     .await
     .map_err(|err| db_err("Failed to delete task", err))?;
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_deleted",
+        Some(from_state),
+        None,
+        json!({}),
+    )
+    .await?;
 
     Ok(())
 }
@@ -405,21 +602,48 @@ pub async fn create_task_link_with_roles(
         ));
     }
 
+    let subtask_parent_state = match payload.link_type {
+        TaskLinkType::SubtaskOf => payload.subtask_parent_state.ok_or_else(|| {
+            LibError::invalid(
+                "Subtask links require a parent state",
+                anyhow!("subtask_of link missing subtask_parent_state"),
+            )
+        })?,
+        _ => {
+            if payload.subtask_parent_state.is_some() {
+                return Err(LibError::invalid(
+                    "Only subtask links may set subtaskParentState",
+                    anyhow!("non-subtask link included subtaskParentState"),
+                ));
+            }
+            TaskState::Open
+        }
+    };
+
+    let subtask_parent_state = match payload.link_type {
+        TaskLinkType::SubtaskOf => Some(subtask_parent_state),
+        _ => None,
+    };
+
     sqlx::query(
         r#"
         INSERT INTO tasks.task_links (
             task_from_id,
             task_to_id,
-            link_type
+            link_type,
+            subtask_parent_state
         )
-        VALUES ($1, $2, $3)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (task_from_id, task_to_id, link_type)
-        DO NOTHING
+        DO UPDATE SET
+            subtask_parent_state = EXCLUDED.subtask_parent_state,
+            created_at = CURRENT_TIMESTAMP
         "#,
     )
     .bind(task_id.0)
     .bind(payload.other_task_id.0)
     .bind(payload.link_type.as_db_value())
+    .bind(subtask_parent_state.map(|state| state.as_str().to_string()))
     .execute(pool)
     .await
     .map_err(|err| db_err("Failed to create task link", err))?;
@@ -430,6 +654,7 @@ pub async fn create_task_link_with_roles(
             task_from_id,
             task_to_id,
             link_type,
+            subtask_parent_state,
             created_at
         FROM tasks.task_links
         WHERE task_from_id = $1
@@ -445,6 +670,21 @@ pub async fn create_task_link_with_roles(
     .await
     .map_err(|err| db_err("Failed to fetch task link", err))?;
 
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_link_created",
+        None,
+        None,
+        json!({
+            "otherTaskId": payload.other_task_id.0,
+            "linkType": payload.link_type.as_db_value(),
+            "subtaskParentState": subtask_parent_state.map(|state| state.as_str()),
+        }),
+    )
+    .await?;
+
     to_task_link(row)
 }
 
@@ -457,7 +697,7 @@ pub async fn delete_task_links_with_roles(
     load_accessible_task(pool, actor, task_id, perm::task_link()).await?;
     load_accessible_task(pool, actor, other_task_id, perm::task_link()).await?;
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         DELETE FROM tasks.task_links
         WHERE (task_from_id = $1 AND task_to_id = $2)
@@ -470,7 +710,72 @@ pub async fn delete_task_links_with_roles(
     .await
     .map_err(|err| db_err("Failed to delete task links", err))?;
 
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_links_deleted",
+        None,
+        None,
+        json!({
+            "otherTaskId": other_task_id.0,
+            "rowsAffected": result.rows_affected(),
+        }),
+    )
+    .await?;
+
     Ok(())
+}
+
+pub async fn create_task_comment_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    payload: CreateTaskCommentPayload,
+) -> Result<TaskComment> {
+    load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
+
+    let body = payload.body.trim().to_string();
+    if body.is_empty() {
+        return Err(LibError::invalid(
+            "Comment body is required",
+            anyhow!("empty task comment"),
+        ));
+    }
+
+    let metadata = payload.metadata.unwrap_or_else(|| json!({}));
+    let comment = insert_task_comment(pool, task_id, actor, body, metadata).await?;
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_comment_created",
+        None,
+        None,
+        json!({ "commentId": comment.id.0 }),
+    )
+    .await?;
+
+    Ok(comment)
+}
+
+pub async fn list_task_comments_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+) -> Result<Vec<TaskComment>> {
+    load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
+    get_task_comments(pool, task_id, TASK_DETAILS_LIMIT).await
+}
+
+pub async fn get_task_log_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+) -> Result<Vec<TaskLogEntry>> {
+    load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
+    get_task_log_entries(pool, task_id, TASK_DETAILS_LIMIT).await
 }
 
 pub async fn transition_task_with_roles(
@@ -479,59 +784,104 @@ pub async fn transition_task_with_roles(
     task_id: TaskId,
     payload: TransitionTaskPayload,
 ) -> Result<TaskDetails> {
-    load_accessible_task(pool, actor, task_id, perm::task_transition()).await?;
+    let existing = load_accessible_task(pool, actor, task_id, perm::task_transition()).await?;
+    let from_state = task_state_from_row(&existing.state)?;
+    let to_state = payload.to_state;
 
-    let assignments = get_task_graph_assignments(pool, task_id).await?;
-    let graph_id = payload
-        .graph_id
-        .or_else(|| assignments.first().map(|a| a.graph_id));
-    let graph_id = graph_id.ok_or_else(|| {
-        LibError::invalid(
-            "Task has no graph assignment",
-            anyhow!("task {task_id} has no graph assignments"),
-        )
-    })?;
-
-    let graph = get_graph(pool, actor, graph_id, graph_perm::graph_read_access_roles())
-        .await
-        .map_err(LibError::from)?;
-
-    let node_exists = graph.nodes.iter().any(|node| node.id == payload.node_id);
-    if !node_exists {
+    if !transition_allowed(from_state, to_state) {
         return Err(LibError::invalid(
-            "Node does not belong to this graph",
-            anyhow!("node {} is not in graph {}", payload.node_id, graph_id),
+            "Transition is not allowed",
+            anyhow!(
+                "invalid transition for task {task_id}: {} -> {}",
+                from_state.as_str(),
+                to_state.as_str()
+            ),
         ));
     }
 
-    let default_order = assignments
-        .iter()
-        .find(|assignment| assignment.graph_id == graph_id)
-        .map(|assignment| assignment.order_added)
-        .unwrap_or(0);
+    let assignee_user_id = match (from_state, to_state) {
+        (TaskState::Todo, TaskState::Assigned) => {
+            Some(payload.assigned_to_user_id.map(|id| id.0).ok_or_else(|| {
+                LibError::invalid(
+                    "assignedToUserId is required for this transition",
+                    anyhow!("todo -> assigned transition missing assigned_to_user_id"),
+                )
+            })?)
+        }
+        (TaskState::Todo, TaskState::InProgress) => Some(actor.0),
+        _ => existing.assignee_user_id,
+    };
+
+    let (completed_by_user_id, completed_at) = if to_state == TaskState::Done {
+        let done_by = payload.done_by_user_id.unwrap_or(actor);
+        let done_at = payload.done_at.unwrap_or_else(Utc::now).naive_utc();
+        (Some(done_by.0), Some(done_at))
+    } else {
+        (None, None)
+    };
+
+    let rejected_reason = if to_state == TaskState::Rejected {
+        normalize_free_text(payload.rejected_reason.clone())
+    } else {
+        None
+    };
 
     sqlx::query(
         r#"
-        INSERT INTO tasks.task_graph_assignments (
-            task_id,
-            graph_id,
-            current_node_id,
-            order_added
-        )
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (task_id, graph_id)
-        DO UPDATE SET
-            current_node_id = EXCLUDED.current_node_id,
+        UPDATE tasks.tasks
+        SET
+            state = $1,
+            assignee_user_id = $2,
+            completed_by_user_id = $3,
+            completed_at = $4,
+            rejected_reason = $5,
             updated_at = CURRENT_TIMESTAMP
+        WHERE id = $6
+          AND deleted_at IS NULL
         "#,
     )
+    .bind(to_state.as_str())
+    .bind(assignee_user_id)
+    .bind(completed_by_user_id)
+    .bind(completed_at)
+    .bind(rejected_reason.clone())
     .bind(task_id.0)
-    .bind(graph_id.0)
-    .bind(payload.node_id.0)
-    .bind(default_order)
     .execute(pool)
     .await
-    .map_err(|err| db_err("Failed to transition task", err))?;
+    .map_err(|err| db_err("Failed to transition task state", err))?;
+
+    let transition_comment = build_transition_comment(from_state, to_state, &payload);
+    let mut transition_comment_id: Option<Uuid> = None;
+    if let Some(body) = transition_comment {
+        let comment = insert_task_comment(pool, task_id, actor, body, json!({})).await?;
+        transition_comment_id = Some(comment.id.0);
+    }
+
+    let mut details = transition_details(
+        from_state,
+        to_state,
+        &payload,
+        assignee_user_id,
+        completed_by_user_id,
+        completed_at,
+        rejected_reason.as_deref(),
+    );
+    if let Some(comment_id) = transition_comment_id
+        && let Some(details_obj) = details.as_object_mut()
+    {
+        details_obj.insert("commentId".to_string(), json!(comment_id));
+    }
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_transitioned",
+        Some(from_state),
+        Some(to_state),
+        details,
+    )
+    .await?;
 
     get_task_with_roles(pool, actor, task_id).await
 }
