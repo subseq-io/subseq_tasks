@@ -2154,8 +2154,6 @@ mod tests {
             )?;
             assert_eq!(link.link_type, TaskLinkType::RelatedTo);
 
-            map_tasks_lib(delete_task_with_roles(&pool, member, member_task.task.id).await)?;
-
             let owner_aux = map_tasks_lib(
                 create_task_with_roles(
                     &pool,
@@ -2164,6 +2162,8 @@ mod tests {
                 )
                 .await,
             )?;
+
+            map_tasks_lib(delete_task_with_roles(&pool, member, member_task.task.id).await)?;
 
             let outsider_read_err = get_task_with_roles(&pool, outsider, fixture.seed_task_id)
                 .await
