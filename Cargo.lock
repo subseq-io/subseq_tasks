@@ -2614,6 +2614,7 @@ dependencies = [
  "sqlx",
  "subseq_auth",
  "subseq_graph",
+ "tokio",
  "tracing",
  "uuid",
 ]

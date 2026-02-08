@@ -1615,6 +1615,55 @@ pub async fn transition_task_with_roles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result as AnyResult;
+    use serde_json::json;
+    use sqlx::PgPool;
+    use std::future::Future;
+    use subseq_auth::db::{GroupMembershipRow, GroupRoleRow, GroupRow, UserRoleRow, UserRow};
+    use subseq_graph::db as graph_db;
+    use subseq_graph::models::{CreateGraphPayload as GraphCreatePayload, NewGraphNode};
+    use subseq_graph::permissions as graph_perm;
+
+    #[derive(Clone, Copy)]
+    struct Actors {
+        owner: UserId,
+        member: UserId,
+        outsider: UserId,
+        group_id: GroupId,
+    }
+
+    #[derive(Clone)]
+    struct Fixture {
+        actors: Actors,
+        project: Project,
+        seed_task_id: TaskId,
+    }
+
+    fn map_tasks_lib<T>(result: Result<T>) -> AnyResult<T> {
+        result.map_err(|err| anyhow::anyhow!("{}: {}", err.public, err.source))
+    }
+
+    fn map_graph_lib<T>(
+        result: std::result::Result<T, subseq_graph::error::LibError>,
+    ) -> AnyResult<T> {
+        result.map_err(|err| anyhow::anyhow!("{}: {}", err.public, err.source))
+    }
+
+    async fn with_test_db<F, Fut>(run: F) -> AnyResult<()>
+    where
+        F: FnOnce(PgPool) -> Fut,
+        Fut: Future<Output = AnyResult<()>>,
+    {
+        let test_db = crate::test_harness::TestDb::new().await?;
+        test_db.prepare().await?;
+
+        let pool = test_db.pool.clone();
+        let run_result = run(pool).await;
+        let teardown_result = test_db.teardown().await;
+
+        teardown_result?;
+        run_result
+    }
 
     fn transition_payload(to_state: TaskState) -> TransitionTaskPayload {
         TransitionTaskPayload {
@@ -1631,6 +1680,251 @@ mod tests {
             rejected_reason: None,
             comment: None,
         }
+    }
+
+    fn create_task_payload(project_id: ProjectId, title: &str) -> CreateTaskPayload {
+        CreateTaskPayload {
+            project_id,
+            title: title.to_string(),
+            description: Some(format!("Description for {title}")),
+            assignee_user_id: None,
+            priority: Some(0),
+            due_date: None,
+            milestone_id: None,
+            state: None,
+            metadata: Some(json!({})),
+        }
+    }
+
+    fn update_title_payload(title: &str) -> UpdateTaskPayload {
+        UpdateTaskPayload {
+            title: Some(title.to_string()),
+            description: None,
+            assignee_user_id: None,
+            clear_assignee: None,
+            priority: None,
+            due_date: None,
+            clear_due_date: None,
+            milestone_id: None,
+            clear_milestone: None,
+            state: None,
+            archived: None,
+            metadata: None,
+        }
+    }
+
+    fn archive_payload(archived: bool) -> UpdateTaskPayload {
+        UpdateTaskPayload {
+            title: None,
+            description: None,
+            assignee_user_id: None,
+            clear_assignee: None,
+            priority: None,
+            due_date: None,
+            clear_due_date: None,
+            milestone_id: None,
+            clear_milestone: None,
+            state: None,
+            archived: Some(archived),
+            metadata: None,
+        }
+    }
+
+    async fn insert_user(pool: &PgPool, user_id: UserId, username: &str) -> AnyResult<()> {
+        let user = UserRow::new(
+            user_id,
+            Some(username.to_string()),
+            format!("{username}-{}@example.com", user_id.0),
+            Some(json!({ "displayName": username })),
+        );
+        UserRow::insert(pool, &user).await?;
+        Ok(())
+    }
+
+    async fn setup_actors(pool: &PgPool) -> AnyResult<Actors> {
+        let owner = UserId(Uuid::new_v4());
+        let member = UserId(Uuid::new_v4());
+        let outsider = UserId(Uuid::new_v4());
+        let group_id = GroupId(Uuid::new_v4());
+
+        insert_user(pool, owner, "owner").await?;
+        insert_user(pool, member, "member").await?;
+        insert_user(pool, outsider, "outsider").await?;
+
+        GroupRow::insert(
+            pool,
+            &GroupRow::new(
+                group_id.0,
+                Some(json!({ "fixture": true })),
+                &format!("group-{}", group_id.0),
+            ),
+        )
+        .await?;
+
+        GroupMembershipRow::add_member(pool, &GroupMembershipRow::new(group_id, owner, "owner"))
+            .await?;
+        GroupMembershipRow::add_member(pool, &GroupMembershipRow::new(group_id, member, "member"))
+            .await?;
+
+        Ok(Actors {
+            owner,
+            member,
+            outsider,
+            group_id,
+        })
+    }
+
+    async fn clear_group_roles(pool: &PgPool, group_id: GroupId) -> AnyResult<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM auth.group_roles
+            WHERE group_id = $1
+            "#,
+        )
+        .bind(group_id.0)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn grant_group_role(
+        pool: &PgPool,
+        group_id: GroupId,
+        scope: &str,
+        scope_id: &str,
+        role_name: &str,
+    ) -> AnyResult<()> {
+        GroupRoleRow::allow(
+            pool,
+            &GroupRoleRow::new(group_id, scope, scope_id, role_name),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn grant_user_graph_role(
+        pool: &PgPool,
+        user_id: UserId,
+        group_id: GroupId,
+        role_name: &str,
+    ) -> AnyResult<()> {
+        let scope_id = graph_perm::graph_role_scope_id_for_group(group_id);
+        UserRoleRow::allow(
+            pool,
+            &UserRoleRow::new(
+                user_id,
+                graph_perm::graph_role_scope(),
+                &scope_id,
+                role_name,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn create_graph_for_group(
+        pool: &PgPool,
+        actor: UserId,
+        group_id: GroupId,
+        name: &str,
+    ) -> AnyResult<GraphId> {
+        let graph = map_graph_lib(
+            graph_db::create_graph(
+                pool,
+                actor,
+                GraphCreatePayload {
+                    kind: GraphKind::Directed,
+                    name: name.to_string(),
+                    description: Some("fixture".to_string()),
+                    metadata: Some(json!({ "fixture": true })),
+                    owner_group_id: Some(group_id),
+                    nodes: vec![NewGraphNode {
+                        id: None,
+                        label: "entry".to_string(),
+                        metadata: Some(json!({})),
+                    }],
+                    edges: vec![],
+                },
+                graph_perm::graph_create_access_roles(),
+            )
+            .await,
+        )?;
+        Ok(graph.id)
+    }
+
+    async fn setup_fixture(pool: &PgPool) -> AnyResult<Fixture> {
+        let actors = setup_actors(pool).await?;
+
+        grant_user_graph_role(
+            pool,
+            actors.owner,
+            actors.group_id,
+            graph_perm::graph_create_role(),
+        )
+        .await?;
+        grant_user_graph_role(
+            pool,
+            actors.owner,
+            actors.group_id,
+            graph_perm::graph_read_role(),
+        )
+        .await?;
+
+        clear_group_roles(pool, actors.group_id).await?;
+        for role in [
+            perm::project_create(),
+            perm::project_read(),
+            perm::task_create(),
+            perm::task_link(),
+            perm::task_update(),
+            perm::task_delete(),
+            perm::task_transition(),
+        ] {
+            grant_group_role(
+                pool,
+                actors.group_id,
+                perm::scope_tasks(),
+                perm::scope_id_global(),
+                role,
+            )
+            .await?;
+        }
+
+        let state_graph_id =
+            create_graph_for_group(pool, actors.owner, actors.group_id, "task-state").await?;
+        let task_graph_id =
+            create_graph_for_group(pool, actors.owner, actors.group_id, "task-flow").await?;
+
+        let project = map_tasks_lib(
+            create_project_with_roles(
+                pool,
+                actors.owner,
+                CreateProjectPayload {
+                    name: "Fixture Project".to_string(),
+                    description: Some("Fixture project".to_string()),
+                    owner_group_id: Some(actors.group_id),
+                    task_state_graph_id: state_graph_id,
+                    task_graph_id: Some(task_graph_id),
+                    metadata: Some(json!({ "fixture": true })),
+                },
+            )
+            .await,
+        )?;
+
+        let seed_task = map_tasks_lib(
+            create_task_with_roles(
+                pool,
+                actors.owner,
+                create_task_payload(project.id, "Seed task"),
+            )
+            .await,
+        )?;
+
+        Ok(Fixture {
+            actors,
+            project,
+            seed_task_id: seed_task.task.id,
+        })
     }
 
     #[test]
@@ -1777,5 +2071,502 @@ mod tests {
         )
         .expect("assigned -> todo should preserve existing assignee");
         assert_eq!(preserved, existing_assignee);
+    }
+
+    #[tokio::test]
+    async fn secured_task_actions_enforce_owner_group_and_unauthorized_boundaries() -> AnyResult<()>
+    {
+        with_test_db(|pool| async move {
+            let fixture = setup_fixture(&pool).await?;
+            let Actors {
+                owner,
+                member,
+                outsider,
+                group_id,
+            } = fixture.actors;
+            let project_scope_id = fixture.project.id.0.to_string();
+
+            grant_user_graph_role(&pool, member, group_id, graph_perm::graph_read_role()).await?;
+
+            clear_group_roles(&pool, group_id).await?;
+            for role in [
+                perm::task_create(),
+                perm::task_update(),
+                perm::task_delete(),
+                perm::task_link(),
+                perm::task_transition(),
+            ] {
+                grant_group_role(
+                    &pool,
+                    group_id,
+                    perm::scope_project(),
+                    &project_scope_id,
+                    role,
+                )
+                .await?;
+            }
+
+            let _ = map_tasks_lib(get_task_with_roles(&pool, member, fixture.seed_task_id).await)?;
+
+            let member_task = map_tasks_lib(
+                create_task_with_roles(
+                    &pool,
+                    member,
+                    create_task_payload(fixture.project.id, "Member task"),
+                )
+                .await,
+            )?;
+
+            let updated = map_tasks_lib(
+                update_task_with_roles(
+                    &pool,
+                    member,
+                    member_task.task.id,
+                    update_title_payload("Member task updated"),
+                )
+                .await,
+            )?;
+            assert_eq!(updated.task.title, "Member task updated");
+
+            let transitioned = map_tasks_lib(
+                transition_task_with_roles(
+                    &pool,
+                    member,
+                    member_task.task.id,
+                    transition_payload(TaskState::Todo),
+                )
+                .await,
+            )?;
+            assert_eq!(transitioned.task.state, TaskState::Todo);
+
+            let link = map_tasks_lib(
+                create_task_link_with_roles(
+                    &pool,
+                    member,
+                    fixture.seed_task_id,
+                    CreateTaskLinkPayload {
+                        other_task_id: member_task.task.id,
+                        link_type: TaskLinkType::RelatedTo,
+                        subtask_parent_state: None,
+                    },
+                )
+                .await,
+            )?;
+            assert_eq!(link.link_type, TaskLinkType::RelatedTo);
+
+            map_tasks_lib(delete_task_with_roles(&pool, member, member_task.task.id).await)?;
+
+            let owner_aux = map_tasks_lib(
+                create_task_with_roles(
+                    &pool,
+                    owner,
+                    create_task_payload(fixture.project.id, "Owner aux"),
+                )
+                .await,
+            )?;
+
+            let outsider_read_err = get_task_with_roles(&pool, outsider, fixture.seed_task_id)
+                .await
+                .expect_err("outsider should not read group task");
+            assert_eq!(outsider_read_err.kind, ErrorKind::Forbidden);
+
+            let outsider_create_err = create_task_with_roles(
+                &pool,
+                outsider,
+                create_task_payload(fixture.project.id, "Outsider task"),
+            )
+            .await
+            .expect_err("outsider should not create group task");
+            assert_eq!(outsider_create_err.kind, ErrorKind::Forbidden);
+
+            let outsider_update_err = update_task_with_roles(
+                &pool,
+                outsider,
+                fixture.seed_task_id,
+                update_title_payload("nope"),
+            )
+            .await
+            .expect_err("outsider should not update group task");
+            assert_eq!(outsider_update_err.kind, ErrorKind::Forbidden);
+
+            let outsider_transition_err = transition_task_with_roles(
+                &pool,
+                outsider,
+                fixture.seed_task_id,
+                transition_payload(TaskState::Todo),
+            )
+            .await
+            .expect_err("outsider should not transition group task");
+            assert_eq!(outsider_transition_err.kind, ErrorKind::Forbidden);
+
+            let outsider_link_err = create_task_link_with_roles(
+                &pool,
+                outsider,
+                fixture.seed_task_id,
+                CreateTaskLinkPayload {
+                    other_task_id: owner_aux.task.id,
+                    link_type: TaskLinkType::RelatedTo,
+                    subtask_parent_state: None,
+                },
+            )
+            .await
+            .expect_err("outsider should not link group tasks");
+            assert_eq!(outsider_link_err.kind, ErrorKind::Forbidden);
+
+            let outsider_delete_err = delete_task_with_roles(&pool, outsider, fixture.seed_task_id)
+                .await
+                .expect_err("outsider should not delete group task");
+            assert_eq!(outsider_delete_err.kind, ErrorKind::Forbidden);
+
+            clear_group_roles(&pool, group_id).await?;
+
+            let _ = map_tasks_lib(get_task_with_roles(&pool, owner, fixture.seed_task_id).await)?;
+
+            let owner_updated = map_tasks_lib(
+                update_task_with_roles(
+                    &pool,
+                    owner,
+                    fixture.seed_task_id,
+                    update_title_payload("Owner override title"),
+                )
+                .await,
+            )?;
+            assert_eq!(owner_updated.task.title, "Owner override title");
+
+            let owner_transitioned = map_tasks_lib(
+                transition_task_with_roles(
+                    &pool,
+                    owner,
+                    fixture.seed_task_id,
+                    transition_payload(TaskState::Todo),
+                )
+                .await,
+            )?;
+            assert_eq!(owner_transitioned.task.state, TaskState::Todo);
+
+            map_tasks_lib(delete_task_with_roles(&pool, owner, owner_aux.task.id).await)?;
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn scoped_write_roles_imply_read_for_tasks_and_projects() -> AnyResult<()> {
+        with_test_db(|pool| async move {
+            let fixture = setup_fixture(&pool).await?;
+            let Actors {
+                member, group_id, ..
+            } = fixture.actors;
+            let project_scope_id = fixture.project.id.0.to_string();
+            let task_scope_id = fixture.seed_task_id.0.to_string();
+
+            grant_user_graph_role(&pool, member, group_id, graph_perm::graph_read_role()).await?;
+
+            clear_group_roles(&pool, group_id).await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_project(),
+                &project_scope_id,
+                perm::task_update(),
+            )
+            .await?;
+            let _ = map_tasks_lib(get_task_with_roles(&pool, member, fixture.seed_task_id).await)?;
+
+            clear_group_roles(&pool, group_id).await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_task(),
+                &task_scope_id,
+                perm::task_update(),
+            )
+            .await?;
+            let _ = map_tasks_lib(get_task_with_roles(&pool, member, fixture.seed_task_id).await)?;
+
+            clear_group_roles(&pool, group_id).await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_tasks(),
+                perm::scope_id_global(),
+                perm::task_update(),
+            )
+            .await?;
+            let _ = map_tasks_lib(get_task_with_roles(&pool, member, fixture.seed_task_id).await)?;
+
+            clear_group_roles(&pool, group_id).await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_project(),
+                &project_scope_id,
+                perm::project_update(),
+            )
+            .await?;
+            let _ = map_tasks_lib(get_project_with_roles(&pool, member, fixture.project.id).await)?;
+
+            clear_group_roles(&pool, group_id).await?;
+            let project_err = get_project_with_roles(&pool, member, fixture.project.id)
+                .await
+                .expect_err("member without project role should not read project");
+            assert_eq!(project_err.kind, ErrorKind::Forbidden);
+
+            let task_err = get_task_with_roles(&pool, member, fixture.seed_task_id)
+                .await
+                .expect_err("member without task roles should not read task");
+            assert_eq!(task_err.kind, ErrorKind::Forbidden);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn project_and_task_reads_require_graph_access() -> AnyResult<()> {
+        with_test_db(|pool| async move {
+            let fixture = setup_fixture(&pool).await?;
+            let Actors {
+                member, group_id, ..
+            } = fixture.actors;
+            let project_scope_id = fixture.project.id.0.to_string();
+
+            clear_group_roles(&pool, group_id).await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_project(),
+                &project_scope_id,
+                perm::project_read(),
+            )
+            .await?;
+            grant_group_role(
+                &pool,
+                group_id,
+                perm::scope_project(),
+                &project_scope_id,
+                perm::task_read(),
+            )
+            .await?;
+
+            let project_err = get_project_with_roles(&pool, member, fixture.project.id)
+                .await
+                .expect_err("project read should require graph read permission");
+            assert_eq!(project_err.kind, ErrorKind::Forbidden);
+
+            let task_err = get_task_with_roles(&pool, member, fixture.seed_task_id)
+                .await
+                .expect_err("task read should require graph read permission");
+            assert_eq!(task_err.kind, ErrorKind::Forbidden);
+
+            grant_user_graph_role(&pool, member, group_id, graph_perm::graph_read_role()).await?;
+
+            let _ = map_tasks_lib(get_project_with_roles(&pool, member, fixture.project.id).await)?;
+            let _ = map_tasks_lib(get_task_with_roles(&pool, member, fixture.seed_task_id).await)?;
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn transitions_append_comment_and_log_context() -> AnyResult<()> {
+        with_test_db(|pool| async move {
+            let fixture = setup_fixture(&pool).await?;
+            let owner = fixture.actors.owner;
+
+            let mut payload = transition_payload(TaskState::Todo);
+            payload.when = Some(Utc::now());
+            payload.comment = Some("Kickoff".to_string());
+
+            let details = map_tasks_lib(
+                transition_task_with_roles(&pool, owner, fixture.seed_task_id, payload).await,
+            )?;
+            assert_eq!(details.task.state, TaskState::Todo);
+            assert_eq!(details.comments.len(), 1);
+            let transition_comment = details
+                .comments
+                .last()
+                .expect("transition should create one comment");
+            assert!(transition_comment.body.contains("Kickoff"));
+            assert!(transition_comment.body.contains("Moved to todo at"));
+
+            let log_entries =
+                map_tasks_lib(get_task_log_with_roles(&pool, owner, fixture.seed_task_id).await)?;
+            let transition_entry = log_entries
+                .iter()
+                .find(|entry| entry.action == "task_transitioned")
+                .expect("transition log entry should exist");
+            assert_eq!(transition_entry.from_state, Some(TaskState::Open));
+            assert_eq!(transition_entry.to_state, Some(TaskState::Todo));
+            assert_eq!(
+                transition_entry.details.get("commentId"),
+                Some(&json!(transition_comment.id.0))
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn subtree_cascade_impact_matches_archive_unarchive_delete() -> AnyResult<()> {
+        with_test_db(|pool| async move {
+            let fixture = setup_fixture(&pool).await?;
+            let owner = fixture.actors.owner;
+            let root_task_id = fixture.seed_task_id;
+
+            let child_task = map_tasks_lib(
+                create_task_with_roles(
+                    &pool,
+                    owner,
+                    create_task_payload(fixture.project.id, "Child task"),
+                )
+                .await,
+            )?;
+            let grandchild_task = map_tasks_lib(
+                create_task_with_roles(
+                    &pool,
+                    owner,
+                    create_task_payload(fixture.project.id, "Grandchild task"),
+                )
+                .await,
+            )?;
+
+            let _ = map_tasks_lib(
+                create_task_link_with_roles(
+                    &pool,
+                    owner,
+                    root_task_id,
+                    CreateTaskLinkPayload {
+                        other_task_id: child_task.task.id,
+                        link_type: TaskLinkType::SubtaskOf,
+                        subtask_parent_state: Some(TaskState::Todo),
+                    },
+                )
+                .await,
+            )?;
+            let _ = map_tasks_lib(
+                create_task_link_with_roles(
+                    &pool,
+                    owner,
+                    child_task.task.id,
+                    CreateTaskLinkPayload {
+                        other_task_id: grandchild_task.task.id,
+                        link_type: TaskLinkType::SubtaskOf,
+                        subtask_parent_state: Some(TaskState::Todo),
+                    },
+                )
+                .await,
+            )?;
+
+            let archive_impact = map_tasks_lib(
+                task_cascade_impact_with_roles(
+                    &pool,
+                    owner,
+                    root_task_id,
+                    TaskCascadeImpactQuery {
+                        operation: TaskCascadeOperation::Archive,
+                    },
+                )
+                .await,
+            )?;
+            assert_eq!(archive_impact.affected_task_count, 3);
+
+            let _ = map_tasks_lib(
+                update_task_with_roles(&pool, owner, root_task_id, archive_payload(true)).await,
+            )?;
+            assert!(
+                map_tasks_lib(get_task_with_roles(&pool, owner, root_task_id).await)?
+                    .task
+                    .archived
+            );
+            assert!(
+                map_tasks_lib(get_task_with_roles(&pool, owner, child_task.task.id).await)?
+                    .task
+                    .archived
+            );
+            assert!(
+                map_tasks_lib(get_task_with_roles(&pool, owner, grandchild_task.task.id).await)?
+                    .task
+                    .archived
+            );
+
+            let archive_again = map_tasks_lib(
+                task_cascade_impact_with_roles(
+                    &pool,
+                    owner,
+                    root_task_id,
+                    TaskCascadeImpactQuery {
+                        operation: TaskCascadeOperation::Archive,
+                    },
+                )
+                .await,
+            )?;
+            assert_eq!(archive_again.affected_task_count, 0);
+
+            let unarchive_impact = map_tasks_lib(
+                task_cascade_impact_with_roles(
+                    &pool,
+                    owner,
+                    root_task_id,
+                    TaskCascadeImpactQuery {
+                        operation: TaskCascadeOperation::Unarchive,
+                    },
+                )
+                .await,
+            )?;
+            assert_eq!(unarchive_impact.affected_task_count, 3);
+
+            let _ = map_tasks_lib(
+                update_task_with_roles(&pool, owner, root_task_id, archive_payload(false)).await,
+            )?;
+            assert!(
+                !map_tasks_lib(get_task_with_roles(&pool, owner, root_task_id).await)?
+                    .task
+                    .archived
+            );
+
+            let delete_impact = map_tasks_lib(
+                task_cascade_impact_with_roles(
+                    &pool,
+                    owner,
+                    root_task_id,
+                    TaskCascadeImpactQuery {
+                        operation: TaskCascadeOperation::Delete,
+                    },
+                )
+                .await,
+            )?;
+            assert_eq!(delete_impact.affected_task_count, 3);
+
+            map_tasks_lib(delete_task_with_roles(&pool, owner, root_task_id).await)?;
+
+            let deleted_count: (i64,) = sqlx::query_as(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM tasks.tasks
+                WHERE id = ANY($1)
+                  AND deleted_at IS NOT NULL
+                "#,
+            )
+            .bind(vec![
+                root_task_id.0,
+                child_task.task.id.0,
+                grandchild_task.task.id.0,
+            ])
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(deleted_count.0, 3);
+
+            let child_err = get_task_with_roles(&pool, owner, child_task.task.id)
+                .await
+                .expect_err("deleted subtree task should not be accessible");
+            assert_eq!(child_err.kind, ErrorKind::NotFound);
+
+            Ok(())
+        })
+        .await
     }
 }

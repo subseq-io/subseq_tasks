@@ -20,3 +20,6 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 default = ["api"]
 api = ["dep:axum", "sqlx"]
 sqlx = ["dep:sqlx"]
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }

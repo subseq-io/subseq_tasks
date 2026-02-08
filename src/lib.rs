@@ -5,6 +5,8 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod permissions;
+#[cfg(test)]
+pub mod test_harness;
 
 pub mod prelude {
     #[cfg(feature = "api")]
