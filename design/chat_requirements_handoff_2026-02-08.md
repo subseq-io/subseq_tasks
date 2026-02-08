@@ -151,6 +151,14 @@ Implemented in this repo during this chat:
 - Added workflow states and transition endpoint behavior with logging/comment capture.
 - Added `subtask_parent_state` support on task links.
 - Updated README with role and workflow behavior.
+- Added graph-backed constraint validation for task links using `subseq_graph` invariants at mutation boundaries:
+  - `subtask_of` modeled as project-level forest through synthetic project-root tree validation.
+  - `depends_on` validated as DAG.
+  - `related_to`/`assignment_order` validated as directed graph.
+- Added shared-project mirrored validation for link changes with transactional locking and all-or-nothing blocking on any violating shared project.
+- Implemented cascading subtree archive/unarchive/delete behavior from `subtask_of` structure.
+- Added cascade impact preflight API support for UI confirmation:
+  - `GET /task/{task_id}/impact?operation=archive|unarchive|delete`.
 
 ## Process Preference Captured
 Future requirement/design discussions should be written to a Markdown file in the repo (for example under `/design`) rather than only existing in chat text.

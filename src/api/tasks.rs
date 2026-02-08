@@ -9,8 +9,8 @@ use subseq_auth::prelude::AuthenticatedUser;
 
 use crate::db;
 use crate::models::{
-    CreateTaskCommentPayload, CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery, TaskId,
-    TransitionTaskPayload, UpdateTaskPayload,
+    CreateTaskCommentPayload, CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery,
+    TaskCascadeImpactQuery, TaskId, TransitionTaskPayload, UpdateTaskPayload,
 };
 
 use super::{AppError, TasksApp};
@@ -139,6 +139,20 @@ where
     Ok(Json(log))
 }
 
+async fn get_task_cascade_impact_handler<S>(
+    State(app): State<S>,
+    auth_user: AuthenticatedUser,
+    Path(task_id): Path<TaskId>,
+    Query(query): Query<TaskCascadeImpactQuery>,
+) -> Result<impl IntoResponse, AppError>
+where
+    S: TasksApp + Clone + Send + Sync + 'static,
+{
+    let impact =
+        db::task_cascade_impact_with_roles(&app.pool(), auth_user.id(), task_id, query).await?;
+    Ok(Json(impact))
+}
+
 async fn delete_task_links_handler<S>(
     State(app): State<S>,
     auth_user: AuthenticatedUser,
@@ -184,6 +198,10 @@ where
         .route(
             "/task/{task_id}/comments",
             get(list_task_comments_handler::<S>).post(create_task_comment_handler::<S>),
+        )
+        .route(
+            "/task/{task_id}/impact",
+            get(get_task_cascade_impact_handler::<S>),
         )
         .route(
             "/task/{task_id}/link/{other_task_id}",

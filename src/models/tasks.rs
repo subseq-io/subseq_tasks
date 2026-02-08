@@ -165,3 +165,35 @@ pub struct CreateTaskCommentPayload {
     pub body: String,
     pub metadata: Option<Value>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCascadeOperation {
+    Archive,
+    Unarchive,
+    Delete,
+}
+
+impl TaskCascadeOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Unarchive => "unarchive",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCascadeImpactQuery {
+    pub operation: TaskCascadeOperation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCascadeImpact {
+    pub task_id: TaskId,
+    pub operation: TaskCascadeOperation,
+    pub affected_task_count: i64,
+}

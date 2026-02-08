@@ -17,9 +17,10 @@ use crate::error::{ErrorKind, LibError, Result};
 use crate::models::{
     CreateMilestonePayload, CreateProjectPayload, CreateTaskCommentPayload, CreateTaskLinkPayload,
     CreateTaskPayload, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
-    ProjectSummary, RepeatSchema, Task, TaskComment, TaskCommentId, TaskDetails,
-    TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskState,
-    TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
+    ProjectSummary, RepeatSchema, Task, TaskCascadeImpact, TaskCascadeImpactQuery,
+    TaskCascadeOperation, TaskComment, TaskCommentId, TaskDetails, TaskGraphAssignment, TaskId,
+    TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskState, TransitionTaskPayload,
+    UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
 };
 use crate::permissions as perm;
 
@@ -1173,5 +1174,5 @@ pub use tasks::{
     create_task_comment_with_roles, create_task_link_with_roles, create_task_with_roles,
     delete_task_links_with_roles, delete_task_with_roles, get_task_log_with_roles,
     get_task_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
-    transition_task_with_roles, update_task_with_roles,
+    task_cascade_impact_with_roles, transition_task_with_roles, update_task_with_roles,
 };

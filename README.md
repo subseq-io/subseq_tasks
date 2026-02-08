@@ -68,6 +68,36 @@ Transitions apply structured side effects:
 
 For non-`subtask_of` links, `subtask_parent_state` must be null.
 
+## Link Graph Constraints
+
+Task links are validated per shared project using `subseq_graph` invariants before writes:
+
+- `subtask_of` is validated as a project-level forest modeled as a tree with a synthetic project-root node.
+- `depends_on` is validated as a DAG.
+- `related_to` and `assignment_order` are validated as directed graphs.
+
+When tasks belong to multiple shared projects, link writes are mirrored logically across all shared projects and blocked if any project graph would violate constraints.
+
+`subtask_of` add operations perform reparent semantics for the child node (full subtree migration behavior).
+
+`subtask_of` delete operations allow detaching a subtree; detached nodes become top-level roots in the project forest model.
+
+## Cascade Operations
+
+Archive/delete operations cascade through `subtask_of` descendants:
+
+- Archive cascades archived state through subtree.
+- Unarchive cascades unarchive state and revalidates project graph integrity before reactivation.
+- Delete cascades soft deletion through subtree and excises associated task links.
+
+For UI confirmation flows, use:
+
+- `GET /task/{task_id}/impact?operation=archive`
+- `GET /task/{task_id}/impact?operation=unarchive`
+- `GET /task/{task_id}/impact?operation=delete`
+
+to retrieve affected task counts.
+
 ## Task Graph Permission Coupling
 
 When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.

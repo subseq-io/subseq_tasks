@@ -55,6 +55,7 @@ where
     tracing::info!("Registering route /task/{{task_id}} [GET,PUT,DELETE]");
     tracing::info!("Registering route /task/{{task_id}}/link [POST]");
     tracing::info!("Registering route /task/{{task_id}}/comments [GET,POST]");
+    tracing::info!("Registering route /task/{{task_id}}/impact [GET]");
     tracing::info!("Registering route /task/{{task_id}}/link/{{other_task_id}} [DELETE]");
     tracing::info!("Registering route /task/{{task_id}}/log [GET]");
     tracing::info!("Registering route /task/{{task_id}}/transition [POST]");
