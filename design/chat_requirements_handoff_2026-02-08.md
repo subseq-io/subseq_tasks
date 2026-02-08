@@ -92,6 +92,25 @@ User clarified relationship semantics should be treated as separate overlay grap
 - Conceptually a **directed knowledge graph**.
 - Backlinks/cycles acceptable.
 
+## Graph-Layer Clarifications (Confirmed)
+Date: 2026-02-08
+
+1. Project-level structure for `subtask_of` is a **forest of trees**, not a single global tree.
+2. Projects are independent graph scopes.
+3. If a task is present in multiple projects, each project stores an independent duplicate node entry for that task.
+4. Graph mutations for multi-project tasks must be mirrored across each project graph and coordinated as **all-or-nothing**:
+- If any project graph would violate invariants, the operation is blocked.
+5. Subtask reparenting is a **full subtree migration**, not a single-node move.
+6. If a task/subtree is detached and becomes isolated from its previous root, it becomes a new top-level root tree in that project forest.
+7. If a task is created as its own root tree and later attached under another task, its previous standalone tree is merged into the destination tree; remove the old graph object only when empty after merge.
+8. Archival and deletion operations cascade through the entire subtree.
+9. UI needs a preflight/count API for destructive subtree operations:
+- \"How many tasks are affected by this operation?\"
+10. Edge directions are fixed:
+- `subtask_of`: `parent -> child`
+- `depends_on`: `prerequisite -> dependent`
+11. Invariant checks should run in the same transaction context as write operations when feasible.
+
 ## Recommended `subseq_graph` Invariant Work (for separate worker)
 1. Add graph kinds: `tree`, `dag`, `directed`.
 2. Persist graph kind in schema/model.
