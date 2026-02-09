@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use axum::{
     Router,
@@ -6,8 +6,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use subseq_auth::prelude::ValidatesIdentity;
+use subseq_auth::user_id::UserId;
 
 use crate::error::{ErrorKind, LibError};
+use crate::models::{ProjectId, TaskId, TaskUpdate};
 
 mod milestones;
 mod projects;
@@ -42,7 +44,20 @@ pub trait HasPool {
     fn pool(&self) -> Arc<sqlx::PgPool>;
 }
 
-pub trait TasksApp: HasPool + ValidatesIdentity {}
+pub type TaskUpdateHookFuture<'a> =
+    Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + 'a>>;
+
+pub trait TasksApp: HasPool + ValidatesIdentity {
+    fn on_task_update(
+        &self,
+        _project_id: ProjectId,
+        _task_id: TaskId,
+        _actor_id: UserId,
+        _task_update: TaskUpdate,
+    ) -> TaskUpdateHookFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
 
 pub fn routes<S>() -> Router<S>
 where

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::anyhow;
 use axum::{
     Json, Router,
@@ -10,16 +12,38 @@ use axum::{
     routing::{delete, get, post},
 };
 use subseq_auth::prelude::AuthenticatedUser;
+use subseq_auth::user_id::UserId;
 
 use crate::db;
 use crate::models::{
-    CreateTaskCommentPayload, CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery,
-    TaskAttachmentFileId, TaskCascadeImpactQuery, TaskCommentId, TaskId, TransitionTaskPayload,
-    UpdateTaskCommentPayload, UpdateTaskPayload,
+    CreateTaskCommentPayload, CreateTaskLinkPayload, CreateTaskPayload, ListTasksQuery, ProjectId,
+    TaskAttachmentFileId, TaskCascadeImpactQuery, TaskCommentId, TaskId, TaskUpdate,
+    TransitionTaskPayload, UpdateTaskCommentPayload, UpdateTaskPayload,
 };
 use crate::{error::LibError, models::TaskFilterRule};
 
 use super::{AppError, TasksApp};
+
+async fn emit_task_update<S>(
+    app: &S,
+    project_ids: &[ProjectId],
+    task_id: TaskId,
+    actor_id: UserId,
+    task_update: TaskUpdate,
+) -> Result<(), AppError>
+where
+    S: TasksApp + Clone + Send + Sync + 'static,
+{
+    let mut seen_projects = HashSet::new();
+    for project_id in project_ids {
+        if !seen_projects.insert(project_id.0) {
+            continue;
+        }
+        app.on_task_update(*project_id, task_id, actor_id, task_update.clone())
+            .await?;
+    }
+    Ok(())
+}
 
 async fn create_task_handler<S>(
     State(app): State<S>,
@@ -29,7 +53,18 @@ async fn create_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let task = db::create_task_with_roles(&app.pool(), auth_user.id(), payload).await?;
+    emit_task_update(
+        &app,
+        &task.project_ids,
+        task.task.id,
+        auth_user.id(),
+        TaskUpdate::TaskCreated {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -87,7 +122,18 @@ async fn update_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let task = db::update_task_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    emit_task_update(
+        &app,
+        &task.project_ids,
+        task.task.id,
+        auth_user.id(),
+        TaskUpdate::TaskUpdated {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok(Json(task))
 }
 
@@ -99,7 +145,16 @@ async fn delete_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     db::delete_task_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskDeleted,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -112,8 +167,20 @@ async fn create_task_link_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let link =
         db::create_task_link_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskLinkCreated {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(link)))
 }
 
@@ -128,6 +195,17 @@ where
 {
     let comment =
         db::create_task_comment_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskCommentCreated {
+            comment_id: comment.id,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(comment)))
 }
 
@@ -160,6 +238,15 @@ where
         payload,
     )
     .await?;
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskCommentUpdated { comment_id },
+    )
+    .await?;
     Ok(Json(comment))
 }
 
@@ -171,7 +258,16 @@ async fn delete_task_comment_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     db::delete_task_comment_with_roles(&app.pool(), auth_user.id(), task_id, comment_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskCommentDeleted { comment_id },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -209,7 +305,16 @@ async fn delete_task_links_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     db::delete_task_links_with_roles(&app.pool(), auth_user.id(), task_id, other_task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskLinkDeleted { other_task_id },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -222,8 +327,19 @@ async fn transition_task_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let task =
         db::transition_task_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    emit_task_update(
+        &app,
+        &task.project_ids,
+        task.task.id,
+        auth_user.id(),
+        TaskUpdate::TaskTransitioned {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok(Json(task))
 }
 
@@ -264,6 +380,15 @@ where
     let attachment =
         db::create_task_attachment_with_roles(&app.pool(), auth_user.id(), task_id, file_id)
             .await?;
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskAttachmentAdded { file_id },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(attachment)))
 }
 
@@ -288,7 +413,16 @@ async fn delete_task_attachment_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let project_ids = db::task_project_ids_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     db::delete_task_attachment_with_roles(&app.pool(), auth_user.id(), task_id, file_id).await?;
+    emit_task_update(
+        &app,
+        &project_ids,
+        task_id,
+        auth_user.id(),
+        TaskUpdate::TaskAttachmentRemoved { file_id },
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

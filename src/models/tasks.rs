@@ -347,6 +347,21 @@ pub struct UpdateTaskCommentPayload {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub enum TaskUpdate {
+    TaskCreated { payload: CreateTaskPayload },
+    TaskUpdated { payload: UpdateTaskPayload },
+    TaskDeleted,
+    TaskTransitioned { payload: TransitionTaskPayload },
+    TaskLinkCreated { payload: CreateTaskLinkPayload },
+    TaskLinkDeleted { other_task_id: TaskId },
+    TaskCommentCreated { comment_id: TaskCommentId },
+    TaskCommentUpdated { comment_id: TaskCommentId },
+    TaskCommentDeleted { comment_id: TaskCommentId },
+    TaskAttachmentAdded { file_id: TaskAttachmentFileId },
+    TaskAttachmentRemoved { file_id: TaskAttachmentFileId },
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCascadeOperation {

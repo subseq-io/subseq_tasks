@@ -1620,6 +1620,6 @@ pub use tasks::{
     delete_task_links_with_roles, delete_task_with_roles, export_task_markdown_with_roles,
     get_task_by_ref_with_roles, get_task_log_with_roles, get_task_with_roles,
     list_task_attachments_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
-    task_cascade_impact_with_roles, transition_task_with_roles, update_task_comment_with_roles,
-    update_task_with_roles,
+    task_cascade_impact_with_roles, task_project_ids_with_roles, transition_task_with_roles,
+    update_task_comment_with_roles, update_task_with_roles,
 };

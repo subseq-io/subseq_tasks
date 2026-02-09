@@ -218,3 +218,27 @@ When assigning a permission for a group, create `auth.group_roles` entries for o
 - `(group_id, 'task', '<task_uuid>', '<role_name>')`
 
 Use whichever scope granularity you need.
+
+## Task Update Hook
+
+`TasksApp` now exposes a task-update hook so applications can react to task mutations.
+
+Trait method:
+
+- `on_task_update(project_id, task_id, actor_id, task_update)`
+
+Hook payload enum:
+
+- `TaskUpdate::TaskCreated { payload }`
+- `TaskUpdate::TaskUpdated { payload }`
+- `TaskUpdate::TaskDeleted`
+- `TaskUpdate::TaskTransitioned { payload }`
+- `TaskUpdate::TaskLinkCreated { payload }`
+- `TaskUpdate::TaskLinkDeleted { other_task_id }`
+- `TaskUpdate::TaskCommentCreated { comment_id }`
+- `TaskUpdate::TaskCommentUpdated { comment_id }`
+- `TaskUpdate::TaskCommentDeleted { comment_id }`
+- `TaskUpdate::TaskAttachmentAdded { file_id }`
+- `TaskUpdate::TaskAttachmentRemoved { file_id }`
+
+The hook is invoked after successful task mutation handlers and is emitted once per project associated with the task.

@@ -1467,6 +1467,34 @@ pub async fn get_task_by_ref_with_roles(
     get_task_with_roles(pool, actor, task_id).await
 }
 
+pub async fn task_project_ids_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+) -> Result<Vec<ProjectId>> {
+    let _ = load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
+    let rows = sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        SELECT DISTINCT tp.project_id
+        FROM tasks.task_projects tp
+        JOIN tasks.projects p
+          ON p.id = tp.project_id
+        WHERE tp.task_id = $1
+          AND p.deleted_at IS NULL
+        ORDER BY tp.project_id ASC
+        "#,
+    )
+    .bind(task_id.0)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task project IDs", err))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(project_id,)| ProjectId(project_id))
+        .collect())
+}
+
 pub async fn export_task_markdown_with_roles(
     pool: &PgPool,
     actor: UserId,

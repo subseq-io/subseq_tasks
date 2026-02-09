@@ -10,7 +10,7 @@ pub mod test_harness;
 
 pub mod prelude {
     #[cfg(feature = "api")]
-    pub use crate::api::{HasPool, TasksApp};
+    pub use crate::api::{HasPool, TaskUpdateHookFuture, TasksApp};
     #[cfg(feature = "sqlx")]
     pub use crate::db::{
         create_milestone_with_roles, create_project_with_roles, create_task_attachment_with_roles,
@@ -21,9 +21,9 @@ pub mod prelude {
         get_milestone_with_roles, get_project_with_roles, get_task_by_ref_with_roles,
         get_task_log_with_roles, get_task_with_roles, list_milestones_with_roles,
         list_projects_with_roles, list_task_attachments_with_roles, list_task_comments_with_roles,
-        list_tasks_with_roles, task_cascade_impact_with_roles, transition_task_with_roles,
-        update_milestone_with_roles, update_project_with_roles, update_task_comment_with_roles,
-        update_task_with_roles,
+        list_tasks_with_roles, task_cascade_impact_with_roles, task_project_ids_with_roles,
+        transition_task_with_roles, update_milestone_with_roles, update_project_with_roles,
+        update_task_comment_with_roles, update_task_with_roles,
     };
     pub use crate::error::{ErrorKind, LibError, Result};
     pub use crate::models::{
@@ -33,7 +33,7 @@ pub mod prelude {
         ProjectSummary, RepeatSchema, Task, TaskAttachment, TaskAttachmentFileId,
         TaskCascadeImpact, TaskCascadeImpactQuery, TaskCascadeOperation, TaskComment,
         TaskCommentId, TaskDetails, TaskFilterRule, TaskGraphAssignment, TaskId, TaskLink,
-        TaskLinkType, TaskLogEntry, TaskLogId, TaskOrderBy, TaskState, TimelineSource,
+        TaskLinkType, TaskLogEntry, TaskLogId, TaskOrderBy, TaskState, TaskUpdate, TimelineSource,
         TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload,
         UpdateTaskCommentPayload, UpdateTaskPayload,
     };
