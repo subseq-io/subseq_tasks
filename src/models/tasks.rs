@@ -1,10 +1,15 @@
+use std::str::FromStr;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subseq_auth::user_id::UserId;
 use subseq_graph::models::{GraphId, GraphNodeId};
 
-use super::{MilestoneId, ProjectId, TaskCommentId, TaskId, TaskLinkType, TaskLogId, TaskState};
+use super::{
+    MilestoneId, ProjectId, TaskAttachmentFileId, TaskCommentId, TaskId, TaskLinkType, TaskLogId,
+    TaskState,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +80,18 @@ pub struct TaskComment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TaskAttachment {
+    pub task_id: TaskId,
+    pub file_id: TaskAttachmentFileId,
+    pub added_by_user_id: UserId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub added_by_username: Option<String>,
+    pub metadata: Value,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskLogEntry {
     pub id: TaskLogId,
     pub task_id: TaskId,
@@ -111,13 +128,82 @@ pub struct TaskDetails {
     pub log: Vec<TaskLogEntry>,
 }
 
+fn deserialize_project_ids<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<ProjectId>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let input = Option::<String>::deserialize(deserializer)?;
+    match input {
+        None => Ok(None),
+        Some(value) => {
+            let mut output = Vec::new();
+            for raw in value.split(',') {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parsed = ProjectId::from_str(trimmed).map_err(|err| {
+                    serde::de::Error::custom(format!(
+                        "Invalid project id in projectIds '{}': {}",
+                        trimmed, err
+                    ))
+                })?;
+                output.push(parsed);
+            }
+            Ok(Some(output))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOrderBy {
+    Created,
+    Updated,
+    Priority,
+    DueDate,
+}
+
+impl TaskOrderBy {
+    pub fn as_db_value(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Priority => "priority",
+            Self::DueDate => "due_date",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskFilterRule {
+    Archived,
+    AssignedTo(UserId),
+    AssignedToMe,
+    Closed,
+    NotClosed,
+    CreatedAfter(DateTime<Utc>),
+    UpdatedAfter(DateTime<Utc>),
+    NodeId(GraphNodeId),
+    InProgress,
+    Open,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListTasksQuery {
+    #[serde(deserialize_with = "deserialize_project_ids")]
+    pub project_ids: Option<Vec<ProjectId>>,
     pub project_id: Option<ProjectId>,
     pub assignee_user_id: Option<UserId>,
     pub state: Option<TaskState>,
     pub archived: Option<bool>,
+    pub query: Option<String>,
+    pub order: Option<TaskOrderBy>,
+    pub filter_rule: Option<String>,
+    pub filter_rule_data: Option<String>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
 }
@@ -127,6 +213,67 @@ impl ListTasksQuery {
         let page = self.page.unwrap_or(1).max(1);
         let limit = self.limit.unwrap_or(25).clamp(1, 200);
         (page, limit)
+    }
+
+    pub fn extract_filter_rule(&self) -> std::result::Result<Option<TaskFilterRule>, String> {
+        let Some(filter_rule) = self.filter_rule.as_deref() else {
+            return Ok(None);
+        };
+        let filter_data = self.filter_rule_data.as_deref();
+        let rule = match filter_rule {
+            "archived" => TaskFilterRule::Archived,
+            "assignedTo" => {
+                let user_id = filter_data.ok_or_else(|| {
+                    "filterRuleData is required for filterRule=assignedTo".to_string()
+                })?;
+                let parsed = UserId::from_str(user_id).map_err(|err| {
+                    format!(
+                        "invalid user id '{}' for filterRule=assignedTo: {}",
+                        user_id, err
+                    )
+                })?;
+                TaskFilterRule::AssignedTo(parsed)
+            }
+            "assignedToMe" => TaskFilterRule::AssignedToMe,
+            "closed" => TaskFilterRule::Closed,
+            "notClosed" => TaskFilterRule::NotClosed,
+            "created" => {
+                let raw = filter_data.ok_or_else(|| {
+                    "filterRuleData is required for filterRule=created".to_string()
+                })?;
+                let parsed = DateTime::parse_from_rfc3339(raw).map_err(|err| {
+                    format!(
+                        "invalid RFC3339 timestamp '{}' for created filter: {}",
+                        raw, err
+                    )
+                })?;
+                TaskFilterRule::CreatedAfter(parsed.with_timezone(&Utc))
+            }
+            "updated" => {
+                let raw = filter_data.ok_or_else(|| {
+                    "filterRuleData is required for filterRule=updated".to_string()
+                })?;
+                let parsed = DateTime::parse_from_rfc3339(raw).map_err(|err| {
+                    format!(
+                        "invalid RFC3339 timestamp '{}' for updated filter: {}",
+                        raw, err
+                    )
+                })?;
+                TaskFilterRule::UpdatedAfter(parsed.with_timezone(&Utc))
+            }
+            "nodeId" => {
+                let raw = filter_data.ok_or_else(|| {
+                    "filterRuleData is required for filterRule=nodeId".to_string()
+                })?;
+                let parsed = GraphNodeId::from_str(raw)
+                    .map_err(|err| format!("invalid graph node id '{}': {}", raw, err))?;
+                TaskFilterRule::NodeId(parsed)
+            }
+            "inProgress" => TaskFilterRule::InProgress,
+            "open" => TaskFilterRule::Open,
+            other => return Err(format!("unsupported filterRule '{}'", other)),
+        };
+        Ok(Some(rule))
     }
 }
 
@@ -193,6 +340,13 @@ pub struct CreateTaskCommentPayload {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskCommentPayload {
+    pub body: String,
+    pub metadata: Option<Value>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCascadeOperation {
@@ -223,4 +377,52 @@ pub struct TaskCascadeImpact {
     pub task_id: TaskId,
     pub operation: TaskCascadeOperation,
     pub affected_task_count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_query() -> ListTasksQuery {
+        ListTasksQuery {
+            project_ids: None,
+            project_id: None,
+            assignee_user_id: None,
+            state: None,
+            archived: None,
+            query: None,
+            order: None,
+            filter_rule: None,
+            filter_rule_data: None,
+            page: None,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn extract_filter_rule_assigned_to_parses_user() {
+        let mut query = base_query();
+        query.filter_rule = Some("assignedTo".to_string());
+        query.filter_rule_data = Some("4f11c6f8-5cf4-4f0e-b2cf-87d0fd9e7883".to_string());
+
+        let parsed = query
+            .extract_filter_rule()
+            .expect("expected assignedTo filter to parse");
+        match parsed {
+            Some(TaskFilterRule::AssignedTo(_)) => {}
+            other => panic!("unexpected parsed filter: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_filter_rule_created_requires_rfc3339() {
+        let mut query = base_query();
+        query.filter_rule = Some("created".to_string());
+        query.filter_rule_data = Some("not-a-date".to_string());
+
+        let error = query
+            .extract_filter_rule()
+            .expect_err("expected invalid RFC3339 date to fail");
+        assert!(error.contains("invalid RFC3339"));
+    }
 }

@@ -62,6 +62,52 @@ Transitions apply structured side effects:
 - Transition-only context (for example feedback or work-log details) is captured in task comments when provided.
 - Every task mutation and transition is appended to `tasks.task_log`.
 
+Task comments now support full lifecycle operations:
+
+- `POST /task/{task_id}/comments` creates comments.
+- `PUT /task/{task_id}/comments/{comment_id}` updates comments.
+- `DELETE /task/{task_id}/comments/{comment_id}` soft-deletes comments.
+- `GET /task/{task_id}/comments` lists active comments.
+
+Comment create/update/delete operations are logged to `tasks.task_log`.
+
+## Task Search And Filters
+
+Task list supports both `/task` and `/task/list` with richer query fields:
+
+- `query`: text match across title/description/slug.
+- `projectId`: single project scope filter.
+- `projectIds`: comma-delimited project UUID list scope filter.
+- `order`: `created`, `updated`, `priority`, or `due_date`.
+- `filterRule` + `filterRuleData`:
+  - `archived`
+  - `assignedTo` (requires `filterRuleData=<user_uuid>`)
+  - `assignedToMe`
+  - `closed`
+  - `notClosed`
+  - `created` (requires RFC3339 timestamp data)
+  - `updated` (requires RFC3339 timestamp data)
+  - `nodeId` (requires graph node UUID data)
+  - `inProgress`
+  - `open`
+
+Filters apply in addition to existing permission boundaries.
+
+## Task Attachments And Markdown Export
+
+Attachments are tracked in `tasks.task_attachments`:
+
+- `POST /task/{task_id}/attachment/{file_id}` attaches a file UUID to the task.
+- `GET /task/{task_id}/attachment/list` lists task attachments.
+- `DELETE /task/{task_id}/attachment/{file_id}` removes an attachment.
+
+Markdown export is available at:
+
+- `GET /task/{task_id}/export`
+- `GET /task/{task_id}/export/markdown`
+
+Task lookup for read/export supports UUID or slug references.
+
 ## Subtasks By Parent State
 
 `subtask_of` edges persist `subtask_parent_state` in graph edge metadata so subtasks can be tied to a specific parent workflow state.
@@ -121,6 +167,13 @@ Project and milestone responses are also denormalized for UI-friendly presentati
 - `tasks.milestone_presentation` enriches milestones with project display context and project owner display fields.
 
 `GET /project/{project_id}`, `GET /project`, `GET /milestone/{milestone_id}`, and `GET /milestone` read from these views after authorization checks.
+
+Milestones now expose recurrence linkage fields:
+
+- `nextMilestoneId`
+- `previousMilestoneId`
+
+Both fields are constrained to milestones inside the same project.
 
 ## Task Graph Permission Coupling
 

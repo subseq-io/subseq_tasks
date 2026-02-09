@@ -36,3 +36,4 @@ uuid_id_type!(MilestoneId);
 uuid_id_type!(TaskId);
 uuid_id_type!(TaskCommentId);
 uuid_id_type!(TaskLogId);
+uuid_id_type!(TaskAttachmentFileId);

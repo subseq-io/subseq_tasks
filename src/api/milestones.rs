@@ -40,6 +40,8 @@ where
         auth_user.id(),
         query.project_id,
         query.completed,
+        query.query.clone(),
+        query.due.map(|value| value.naive_utc()),
         page,
         limit,
     )

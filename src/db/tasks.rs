@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use chrono::Utc;
 use serde::de::DeserializeOwned;
@@ -1302,6 +1303,184 @@ pub async fn create_task_with_roles(
     get_task_with_roles(pool, actor, task_id).await
 }
 
+async fn resolve_task_id_by_ref_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_ref: &str,
+    permission: &str,
+) -> Result<TaskId> {
+    if let Ok(task_uuid) = Uuid::parse_str(task_ref) {
+        let task_id = TaskId(task_uuid);
+        let _ = load_accessible_task(pool, actor, task_id, permission).await?;
+        return Ok(task_id);
+    }
+
+    let task = load_accessible_task_by_slug(pool, actor, task_ref, permission).await?;
+    Ok(TaskId(task.id))
+}
+
+fn render_task_markdown(details: &TaskDetails, attachments: &[TaskAttachment]) -> String {
+    let mut output = String::new();
+    let task = &details.task;
+    let _ = writeln!(&mut output, "# {} ({})", task.title, task.slug);
+    let _ = writeln!(&mut output);
+    let _ = writeln!(&mut output, "- Task ID: `{}`", task.id.0);
+    let _ = writeln!(&mut output, "- State: `{}`", task.state.as_str());
+    let _ = writeln!(&mut output, "- Priority: `{}`", task.priority);
+    let _ = writeln!(
+        &mut output,
+        "- Author: `{}`{}",
+        task.author_user_id.0,
+        task.author_username
+            .as_ref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default()
+    );
+    if let Some(assignee_id) = task.assignee_user_id {
+        let _ = writeln!(
+            &mut output,
+            "- Assignee: `{}`{}",
+            assignee_id.0,
+            task.assignee_username
+                .as_ref()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(milestone_id) = task.milestone_id {
+        let _ = writeln!(
+            &mut output,
+            "- Milestone: `{}`{}",
+            milestone_id.0,
+            task.milestone_name
+                .as_ref()
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(due_date) = task.due_date {
+        let _ = writeln!(&mut output, "- Due Date: `{}`", due_date);
+    }
+    let _ = writeln!(&mut output, "- Archived: `{}`", task.archived);
+    let _ = writeln!(&mut output);
+    let _ = writeln!(&mut output, "## Description");
+    let _ = writeln!(&mut output);
+    let _ = writeln!(
+        &mut output,
+        "{}",
+        if task.description.trim().is_empty() {
+            "_No description._"
+        } else {
+            task.description.trim()
+        }
+    );
+    let _ = writeln!(&mut output);
+
+    if !details.projects.is_empty() {
+        let _ = writeln!(&mut output, "## Projects");
+        let _ = writeln!(&mut output);
+        for project in &details.projects {
+            let _ = writeln!(&mut output, "- {} (`{}`)", project.name, project.id.0);
+        }
+        let _ = writeln!(&mut output);
+    }
+
+    if !details.links_out.is_empty() || !details.links_in.is_empty() {
+        let _ = writeln!(&mut output, "## Links");
+        let _ = writeln!(&mut output);
+        for link in &details.links_out {
+            let _ = writeln!(
+                &mut output,
+                "- out `{}` -> `{}` ({})",
+                link.task_from_id.0,
+                link.task_to_id.0,
+                link.link_type.as_db_value()
+            );
+        }
+        for link in &details.links_in {
+            let _ = writeln!(
+                &mut output,
+                "- in `{}` -> `{}` ({})",
+                link.task_from_id.0,
+                link.task_to_id.0,
+                link.link_type.as_db_value()
+            );
+        }
+        let _ = writeln!(&mut output);
+    }
+
+    if !attachments.is_empty() {
+        let _ = writeln!(&mut output, "## Attachments");
+        let _ = writeln!(&mut output);
+        for attachment in attachments {
+            let _ = writeln!(
+                &mut output,
+                "- file `{}` added by `{}` at `{}`",
+                attachment.file_id.0, attachment.added_by_user_id.0, attachment.created_at
+            );
+        }
+        let _ = writeln!(&mut output);
+    }
+
+    if !details.comments.is_empty() {
+        let _ = writeln!(&mut output, "## Comments");
+        let _ = writeln!(&mut output);
+        for comment in &details.comments {
+            let _ = writeln!(
+                &mut output,
+                "### {} (`{}`) — {}",
+                comment
+                    .author_username
+                    .clone()
+                    .unwrap_or_else(|| comment.author_user_id.0.to_string()),
+                comment.id.0,
+                comment.created_at
+            );
+            let _ = writeln!(&mut output);
+            let _ = writeln!(&mut output, "{}", comment.body.trim());
+            let _ = writeln!(&mut output);
+        }
+    }
+
+    if !details.log.is_empty() {
+        let _ = writeln!(&mut output, "## Task Log");
+        let _ = writeln!(&mut output);
+        for entry in &details.log {
+            let _ = writeln!(
+                &mut output,
+                "- {} `{}` by `{}` at `{}`",
+                entry.action, entry.id.0, entry.actor_user_id.0, entry.created_at
+            );
+        }
+    }
+
+    output
+}
+
+pub async fn get_task_by_ref_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_ref: &str,
+) -> Result<TaskDetails> {
+    let task_id =
+        resolve_task_id_by_ref_with_roles(pool, actor, task_ref, perm::task_read()).await?;
+    get_task_with_roles(pool, actor, task_id).await
+}
+
+pub async fn export_task_markdown_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_ref: &str,
+) -> Result<(String, String)> {
+    let task_id =
+        resolve_task_id_by_ref_with_roles(pool, actor, task_ref, perm::task_read()).await?;
+    let details = get_task_with_roles(pool, actor, task_id).await?;
+    let attachments = list_task_attachments(pool, task_id, TASK_DETAILS_LIMIT).await?;
+    let markdown = render_task_markdown(&details, &attachments);
+    let filename = format!("task-{}.md", details.task.slug);
+    Ok((filename, markdown))
+}
+
 pub async fn get_task_with_roles(
     pool: &PgPool,
     actor: UserId,
@@ -1331,17 +1510,156 @@ pub async fn list_tasks_with_roles(
     pool: &PgPool,
     actor: UserId,
     project_id: Option<ProjectId>,
+    project_ids: Option<Vec<ProjectId>>,
     assignee_user_id: Option<UserId>,
     state: Option<TaskState>,
     archived: Option<bool>,
+    query: Option<String>,
+    order: Option<TaskOrderBy>,
+    filter_rule: Option<TaskFilterRule>,
     page: u32,
     limit: u32,
 ) -> Result<Paged<Task>> {
     let allowed_project_ids = accessible_project_ids(pool, actor, perm::task_read()).await?;
+    if allowed_project_ids.is_empty() {
+        return Ok(Paged {
+            page,
+            limit,
+            items: Vec::new(),
+        });
+    }
+
+    let mut scoped_project_ids: Vec<Uuid> = Vec::new();
+    let has_project_ids_filter = project_ids.is_some();
+    if let Some(project_id) = project_id {
+        if !allowed_project_ids.contains(&project_id.0) {
+            return Ok(Paged {
+                page,
+                limit,
+                items: Vec::new(),
+            });
+        }
+        scoped_project_ids.push(project_id.0);
+    }
+    if let Some(project_ids) = project_ids {
+        let allowed_set: HashSet<Uuid> = allowed_project_ids.iter().copied().collect();
+        let mut scoped_from_list = project_ids
+            .into_iter()
+            .map(|id| id.0)
+            .filter(|id| allowed_set.contains(id))
+            .collect::<Vec<_>>();
+        scoped_from_list.sort();
+        scoped_from_list.dedup();
+
+        if scoped_project_ids.is_empty() {
+            scoped_project_ids = scoped_from_list;
+        } else {
+            let scoped_set: HashSet<Uuid> = scoped_from_list.into_iter().collect();
+            scoped_project_ids.retain(|id| scoped_set.contains(id));
+        }
+    }
+    if (project_id.is_some() || has_project_ids_filter) && scoped_project_ids.is_empty() {
+        return Ok(Paged {
+            page,
+            limit,
+            items: Vec::new(),
+        });
+    }
+
+    let mut effective_assignee = assignee_user_id.map(|id| id.0);
+    let mut effective_state = state.map(|value| value.as_str().to_string());
+    let mut effective_archived = archived;
+    let mut created_after: Option<chrono::NaiveDateTime> = None;
+    let mut updated_after: Option<chrono::NaiveDateTime> = None;
+    let mut current_node_id: Option<Uuid> = None;
+    let mut state_mode: Option<&str> = None;
+
+    if let Some(filter_rule) = filter_rule {
+        match filter_rule {
+            TaskFilterRule::Archived => {
+                if effective_archived == Some(false) {
+                    return Ok(Paged {
+                        page,
+                        limit,
+                        items: Vec::new(),
+                    });
+                }
+                effective_archived = Some(true);
+            }
+            TaskFilterRule::AssignedTo(user_id) => {
+                if let Some(assignee_id) = effective_assignee
+                    && assignee_id != user_id.0
+                {
+                    return Ok(Paged {
+                        page,
+                        limit,
+                        items: Vec::new(),
+                    });
+                }
+                effective_assignee = Some(user_id.0);
+            }
+            TaskFilterRule::AssignedToMe => {
+                if let Some(assignee_id) = effective_assignee
+                    && assignee_id != actor.0
+                {
+                    return Ok(Paged {
+                        page,
+                        limit,
+                        items: Vec::new(),
+                    });
+                }
+                effective_assignee = Some(actor.0);
+            }
+            TaskFilterRule::Closed => {
+                state_mode = Some("closed");
+            }
+            TaskFilterRule::NotClosed => {
+                state_mode = Some("not_closed");
+            }
+            TaskFilterRule::CreatedAfter(value) => {
+                created_after = Some(value.naive_utc());
+            }
+            TaskFilterRule::UpdatedAfter(value) => {
+                updated_after = Some(value.naive_utc());
+            }
+            TaskFilterRule::NodeId(node_id) => {
+                current_node_id = Some(node_id.0);
+            }
+            TaskFilterRule::InProgress => {
+                let in_progress = TaskState::InProgress.as_str().to_string();
+                if let Some(existing) = &effective_state
+                    && existing != &in_progress
+                {
+                    return Ok(Paged {
+                        page,
+                        limit,
+                        items: Vec::new(),
+                    });
+                }
+                effective_state = Some(in_progress);
+            }
+            TaskFilterRule::Open => {
+                state_mode = Some("open");
+            }
+        }
+    }
+
+    let search_query = query
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let search_like = search_query.as_ref().map(|value| format!("%{}%", value));
 
     let offset = (page.saturating_sub(1) as i64).saturating_mul(limit as i64);
+    let has_scoped_project_ids = !scoped_project_ids.is_empty();
 
-    let rows = sqlx::query_as::<_, TaskRow>(
+    let order_clause = match order.unwrap_or(TaskOrderBy::Updated) {
+        TaskOrderBy::Created => "ORDER BY t.created_at DESC, t.id DESC",
+        TaskOrderBy::Updated => "ORDER BY t.updated_at DESC, t.id DESC",
+        TaskOrderBy::Priority => "ORDER BY t.priority DESC, t.updated_at DESC, t.id DESC",
+        TaskOrderBy::DueDate => "ORDER BY t.due_date ASC NULLS LAST, t.updated_at DESC, t.id DESC",
+    };
+
+    let query_text = format!(
         r#"
         SELECT
             t.id,
@@ -1373,32 +1691,65 @@ pub async fn list_tasks_with_roles(
               )
           )
           AND (
-              $3::uuid IS NULL
+              $3::bool = FALSE
               OR EXISTS (
                   SELECT 1
                   FROM tasks.task_projects tp2
                   WHERE tp2.task_id = t.id
-                    AND tp2.project_id = $3
+                    AND tp2.project_id = ANY($4)
               )
           )
-          AND ($4::uuid IS NULL OR t.assignee_user_id = $4)
-          AND ($5::text IS NULL OR t.state = $5)
-          AND ($6::bool IS NULL OR t.archived = $6)
-        ORDER BY t.updated_at DESC, t.id DESC
-        LIMIT $7 OFFSET $8
+          AND ($5::uuid IS NULL OR t.assignee_user_id = $5)
+          AND ($6::text IS NULL OR t.state = $6)
+          AND ($7::bool IS NULL OR t.archived = $7)
+          AND (
+              $8::text IS NULL
+              OR t.title ILIKE $9
+              OR t.description ILIKE $9
+              OR t.slug ILIKE $9
+          )
+          AND ($10::timestamp IS NULL OR t.created_at >= $10)
+          AND ($11::timestamp IS NULL OR t.updated_at >= $11)
+          AND (
+              $12::uuid IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM tasks.task_graph_assignments tga
+                  WHERE tga.task_id = t.id
+                    AND tga.current_node_id = $12
+              )
+          )
+          AND (
+              $13::text IS NULL
+              OR ($13 = 'closed' AND t.state IN ('done', 'rejected'))
+              OR ($13 = 'not_closed' AND t.state NOT IN ('done', 'rejected'))
+              OR ($13 = 'open' AND t.state IN ('open', 'todo', 'assigned', 'acceptance'))
+          )
+        {}
+        LIMIT $14 OFFSET $15
         "#,
-    )
-    .bind(&allowed_project_ids)
-    .bind(actor.0)
-    .bind(project_id.map(|id| id.0))
-    .bind(assignee_user_id.map(|id| id.0))
-    .bind(state.map(|value| value.as_str()))
-    .bind(archived)
-    .bind(limit as i64)
-    .bind(offset)
-    .fetch_all(pool)
-    .await
-    .map_err(|err| db_err("Failed to list tasks", err))?;
+        order_clause,
+    );
+
+    let rows = sqlx::query_as::<_, TaskRow>(&query_text)
+        .bind(&allowed_project_ids)
+        .bind(actor.0)
+        .bind(has_scoped_project_ids)
+        .bind(&scoped_project_ids)
+        .bind(effective_assignee)
+        .bind(effective_state)
+        .bind(effective_archived)
+        .bind(search_query)
+        .bind(search_like)
+        .bind(created_after)
+        .bind(updated_after)
+        .bind(current_node_id)
+        .bind(state_mode)
+        .bind(limit as i64)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| db_err("Failed to list tasks", err))?;
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
@@ -2207,6 +2558,151 @@ pub async fn list_task_comments_with_roles(
 ) -> Result<Vec<TaskComment>> {
     load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
     get_task_comments(pool, task_id, TASK_DETAILS_LIMIT).await
+}
+
+pub async fn update_task_comment_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    comment_id: TaskCommentId,
+    payload: UpdateTaskCommentPayload,
+) -> Result<TaskComment> {
+    load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
+
+    let body = payload.body.trim().to_string();
+    if body.is_empty() {
+        return Err(LibError::invalid(
+            "Comment body is required",
+            anyhow!("empty task comment update"),
+        ));
+    }
+
+    let existing = get_task_comment(pool, task_id, comment_id).await?;
+    let Some(existing) = existing else {
+        return Err(LibError::not_found(
+            "Task comment not found",
+            anyhow!("task {} comment {} not found", task_id, comment_id),
+        ));
+    };
+
+    let metadata = payload.metadata.unwrap_or(existing.metadata);
+    let updated = update_task_comment(pool, task_id, comment_id, body, metadata)
+        .await?
+        .ok_or_else(|| {
+            LibError::not_found(
+                "Task comment not found",
+                anyhow!(
+                    "task {} comment {} not found during update",
+                    task_id,
+                    comment_id
+                ),
+            )
+        })?;
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_comment_updated",
+        None,
+        None,
+        json!({ "commentId": comment_id.0 }),
+    )
+    .await?;
+
+    Ok(updated)
+}
+
+pub async fn delete_task_comment_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    comment_id: TaskCommentId,
+) -> Result<()> {
+    load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
+
+    let deleted = delete_task_comment(pool, task_id, comment_id).await?;
+    if !deleted {
+        return Err(LibError::not_found(
+            "Task comment not found",
+            anyhow!("task {} comment {} not found", task_id, comment_id),
+        ));
+    }
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_comment_deleted",
+        None,
+        None,
+        json!({ "commentId": comment_id.0 }),
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn create_task_attachment_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    file_id: TaskAttachmentFileId,
+) -> Result<TaskAttachment> {
+    load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
+    let attachment = upsert_task_attachment(pool, task_id, file_id, actor, json!({})).await?;
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_attachment_added",
+        None,
+        None,
+        json!({ "fileId": file_id.0 }),
+    )
+    .await?;
+
+    Ok(attachment)
+}
+
+pub async fn list_task_attachments_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+) -> Result<Vec<TaskAttachment>> {
+    load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
+    list_task_attachments(pool, task_id, TASK_DETAILS_LIMIT).await
+}
+
+pub async fn delete_task_attachment_with_roles(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    file_id: TaskAttachmentFileId,
+) -> Result<()> {
+    load_accessible_task(pool, actor, task_id, perm::task_update()).await?;
+
+    let removed = remove_task_attachment(pool, task_id, file_id).await?;
+    if !removed {
+        return Err(LibError::not_found(
+            "Task attachment not found",
+            anyhow!("task {} attachment {} not found", task_id, file_id),
+        ));
+    }
+
+    append_task_log(
+        pool,
+        task_id,
+        actor,
+        "task_attachment_removed",
+        None,
+        None,
+        json!({ "fileId": file_id.0 }),
+    )
+    .await?;
+
+    Ok(())
 }
 
 pub async fn get_task_log_with_roles(

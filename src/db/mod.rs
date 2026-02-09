@@ -18,10 +18,11 @@ use crate::error::{ErrorKind, LibError, Result};
 use crate::models::{
     CreateMilestonePayload, CreateProjectPayload, CreateTaskCommentPayload, CreateTaskLinkPayload,
     CreateTaskPayload, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
-    ProjectSummary, RepeatSchema, Task, TaskCascadeImpact, TaskCascadeImpactQuery,
-    TaskCascadeOperation, TaskComment, TaskCommentId, TaskDetails, TaskGraphAssignment, TaskId,
-    TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskProjectPresentation, TaskState,
-    TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
+    ProjectSummary, RepeatSchema, Task, TaskAttachment, TaskAttachmentFileId, TaskCascadeImpact,
+    TaskCascadeImpactQuery, TaskCascadeOperation, TaskComment, TaskCommentId, TaskDetails,
+    TaskFilterRule, TaskGraphAssignment, TaskId, TaskLink, TaskLinkType, TaskLogEntry, TaskLogId,
+    TaskOrderBy, TaskProjectPresentation, TaskState, TransitionTaskPayload, UpdateMilestonePayload,
+    UpdateProjectPayload, UpdateTaskCommentPayload, UpdateTaskPayload,
 };
 use crate::permissions as perm;
 
@@ -70,6 +71,7 @@ struct ProjectPresentationRow {
 
 #[derive(Debug, Clone, FromRow)]
 struct MilestoneRow {
+    project_id: Uuid,
     milestone_type: String,
     name: String,
     description: String,
@@ -81,6 +83,8 @@ struct MilestoneRow {
     repeat_interval_seconds: Option<i64>,
     repeat_end: Option<chrono::NaiveDateTime>,
     repeat_schema: Option<serde_json::Value>,
+    next_milestone_id: Option<Uuid>,
+    previous_milestone_id: Option<Uuid>,
     metadata: serde_json::Value,
 }
 
@@ -105,6 +109,8 @@ struct MilestonePresentationRow {
     repeat_interval_seconds: Option<i64>,
     repeat_end: Option<chrono::NaiveDateTime>,
     repeat_schema: Option<serde_json::Value>,
+    next_milestone_id: Option<Uuid>,
+    previous_milestone_id: Option<Uuid>,
     metadata: serde_json::Value,
     created_at: chrono::NaiveDateTime,
     updated_at: chrono::NaiveDateTime,
@@ -124,6 +130,8 @@ struct MilestoneAccessRow {
     repeat_interval_seconds: Option<i64>,
     repeat_end: Option<chrono::NaiveDateTime>,
     repeat_schema: Option<serde_json::Value>,
+    next_milestone_id: Option<Uuid>,
+    previous_milestone_id: Option<Uuid>,
     metadata: serde_json::Value,
     project_owner_user_id: Uuid,
     project_owner_group_id: Option<Uuid>,
@@ -188,10 +196,21 @@ struct TaskCommentRow {
     id: Uuid,
     task_id: Uuid,
     author_user_id: Uuid,
+    author_username: Option<String>,
     body: String,
     metadata: serde_json::Value,
     created_at: chrono::NaiveDateTime,
     updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct TaskAttachmentRow {
+    task_id: Uuid,
+    file_id: Uuid,
+    added_by_user_id: Uuid,
+    added_by_username: Option<String>,
+    metadata: serde_json::Value,
+    created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -385,6 +404,8 @@ fn to_milestone_from_presentation_row(row: MilestonePresentationRow) -> Result<M
         repeat_interval_seconds: row.repeat_interval_seconds,
         repeat_end: row.repeat_end,
         repeat_schema: repeat_schema_from_row(row.repeat_schema)?,
+        next_milestone_id: row.next_milestone_id.map(MilestoneId),
+        previous_milestone_id: row.previous_milestone_id.map(MilestoneId),
         metadata: row.metadata,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -423,11 +444,22 @@ fn to_task_comment(row: TaskCommentRow) -> TaskComment {
         id: TaskCommentId(row.id),
         task_id: TaskId(row.task_id),
         author_user_id: UserId(row.author_user_id),
-        author_username: None,
+        author_username: row.author_username,
         body: row.body,
         metadata: row.metadata,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+fn to_task_attachment(row: TaskAttachmentRow) -> TaskAttachment {
+    TaskAttachment {
+        task_id: TaskId(row.task_id),
+        file_id: TaskAttachmentFileId(row.file_id),
+        added_by_user_id: UserId(row.added_by_user_id),
+        added_by_username: row.added_by_username,
+        metadata: row.metadata,
+        created_at: row.created_at,
     }
 }
 
@@ -808,6 +840,8 @@ async fn load_accessible_milestone(
             m.repeat_interval_seconds,
             m.repeat_end,
             m.repeat_schema,
+            m.next_milestone_id,
+            m.previous_milestone_id,
             m.metadata,
             p.owner_user_id AS project_owner_user_id,
             p.owner_group_id AS project_owner_group_id
@@ -837,6 +871,7 @@ async fn load_accessible_milestone(
         .await?;
 
         Ok(MilestoneRow {
+            project_id: row.project_id,
             milestone_type: row.milestone_type,
             name: row.name,
             description: row.description,
@@ -848,6 +883,8 @@ async fn load_accessible_milestone(
             repeat_interval_seconds: row.repeat_interval_seconds,
             repeat_end: row.repeat_end,
             repeat_schema: row.repeat_schema,
+            next_milestone_id: row.next_milestone_id,
+            previous_milestone_id: row.previous_milestone_id,
             metadata: row.metadata,
         })
     } else if milestone_exists(pool, milestone_id).await? {
@@ -974,6 +1011,54 @@ async fn load_accessible_task(
         Err(LibError::not_found(
             "Task not found",
             anyhow!("task {task_id} does not exist"),
+        ))
+    }
+}
+
+async fn load_accessible_task_by_slug(
+    pool: &PgPool,
+    actor: UserId,
+    slug: &str,
+    permission: &str,
+) -> Result<TaskRow> {
+    let row = sqlx::query_as::<_, TaskRow>(
+        r#"
+        SELECT
+            t.id,
+            t.slug,
+            t.title,
+            t.description,
+            t.author_user_id,
+            t.assignee_user_id,
+            t.priority,
+            t.due_date,
+            t.milestone_id,
+            t.state,
+            t.archived,
+            t.completed_by_user_id,
+            t.completed_at,
+            t.rejected_reason,
+            t.metadata,
+            t.created_at,
+            t.updated_at
+        FROM tasks.tasks t
+        WHERE t.slug = $1
+          AND t.deleted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task by slug", err))?;
+
+    if let Some(row) = row {
+        ensure_task_permission(pool, actor, TaskId(row.id), row.author_user_id, permission).await?;
+        Ok(row)
+    } else {
+        Err(LibError::not_found(
+            "Task not found",
+            anyhow!("task slug '{}' does not exist", slug),
         ))
     }
 }
@@ -1126,6 +1211,8 @@ async fn load_milestone_presentation_row(
             repeat_interval_seconds,
             repeat_end,
             repeat_schema,
+            next_milestone_id,
+            previous_milestone_id,
             metadata,
             created_at,
             updated_at
@@ -1186,22 +1273,36 @@ async fn insert_task_comment(
 ) -> Result<TaskComment> {
     let row = sqlx::query_as::<_, TaskCommentRow>(
         r#"
-        INSERT INTO tasks.task_comments (
-            id,
-            task_id,
-            author_user_id,
-            body,
-            metadata
+        WITH inserted AS (
+            INSERT INTO tasks.task_comments (
+                id,
+                task_id,
+                author_user_id,
+                body,
+                metadata
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING
+                id,
+                task_id,
+                author_user_id,
+                body,
+                metadata,
+                created_at,
+                updated_at
         )
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING
-            id,
-            task_id,
-            author_user_id,
-            body,
-            metadata,
-            created_at,
-            updated_at
+        SELECT
+            inserted.id,
+            inserted.task_id,
+            inserted.author_user_id,
+            author_user.username AS author_username,
+            inserted.body,
+            inserted.metadata,
+            inserted.created_at,
+            inserted.updated_at
+        FROM inserted
+        LEFT JOIN auth.users author_user
+          ON author_user.id = inserted.author_user_id
         "#,
     )
     .bind(Uuid::new_v4())
@@ -1216,21 +1317,135 @@ async fn insert_task_comment(
     Ok(to_task_comment(row))
 }
 
+async fn get_task_comment(
+    pool: &PgPool,
+    task_id: TaskId,
+    comment_id: TaskCommentId,
+) -> Result<Option<TaskComment>> {
+    let row = sqlx::query_as::<_, TaskCommentRow>(
+        r#"
+        SELECT
+            tc.id,
+            tc.task_id,
+            tc.author_user_id,
+            author_user.username AS author_username,
+            tc.body,
+            tc.metadata,
+            tc.created_at,
+            tc.updated_at
+        FROM tasks.task_comments tc
+        LEFT JOIN auth.users author_user
+          ON author_user.id = tc.author_user_id
+        WHERE tc.task_id = $1
+          AND tc.id = $2
+          AND tc.deleted_at IS NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(comment_id.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task comment", err))?;
+
+    Ok(row.map(to_task_comment))
+}
+
+async fn update_task_comment(
+    pool: &PgPool,
+    task_id: TaskId,
+    comment_id: TaskCommentId,
+    body: String,
+    metadata: serde_json::Value,
+) -> Result<Option<TaskComment>> {
+    let row = sqlx::query_as::<_, TaskCommentRow>(
+        r#"
+        WITH updated AS (
+            UPDATE tasks.task_comments
+            SET
+                body = $3,
+                metadata = $4,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE task_id = $1
+              AND id = $2
+              AND deleted_at IS NULL
+            RETURNING
+                id,
+                task_id,
+                author_user_id,
+                body,
+                metadata,
+                created_at,
+                updated_at
+        )
+        SELECT
+            updated.id,
+            updated.task_id,
+            updated.author_user_id,
+            author_user.username AS author_username,
+            updated.body,
+            updated.metadata,
+            updated.created_at,
+            updated.updated_at
+        FROM updated
+        LEFT JOIN auth.users author_user
+          ON author_user.id = updated.author_user_id
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(comment_id.0)
+    .bind(body)
+    .bind(metadata)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| db_err("Failed to update task comment", err))?;
+
+    Ok(row.map(to_task_comment))
+}
+
+async fn delete_task_comment(
+    pool: &PgPool,
+    task_id: TaskId,
+    comment_id: TaskCommentId,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE tasks.task_comments
+        SET
+            deleted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE task_id = $1
+          AND id = $2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(comment_id.0)
+    .execute(pool)
+    .await
+    .map_err(|err| db_err("Failed to delete task comment", err))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 async fn get_task_comments(pool: &PgPool, task_id: TaskId, limit: i64) -> Result<Vec<TaskComment>> {
     let rows = sqlx::query_as::<_, TaskCommentRow>(
         r#"
         SELECT
-            id,
-            task_id,
-            author_user_id,
-            body,
-            metadata,
-            created_at,
-            updated_at
-        FROM tasks.task_comments
-        WHERE task_id = $1
-          AND deleted_at IS NULL
-        ORDER BY created_at ASC, id ASC
+            tc.id,
+            tc.task_id,
+            tc.author_user_id,
+            author_user.username AS author_username,
+            tc.body,
+            tc.metadata,
+            tc.created_at,
+            tc.updated_at
+        FROM tasks.task_comments tc
+        LEFT JOIN auth.users author_user
+          ON author_user.id = tc.author_user_id
+        WHERE tc.task_id = $1
+          AND tc.deleted_at IS NULL
+        ORDER BY tc.created_at ASC, tc.id ASC
         LIMIT $2
         "#,
     )
@@ -1241,6 +1456,114 @@ async fn get_task_comments(pool: &PgPool, task_id: TaskId, limit: i64) -> Result
     .map_err(|err| db_err("Failed to query task comments", err))?;
 
     Ok(rows.into_iter().map(to_task_comment).collect())
+}
+
+async fn upsert_task_attachment(
+    pool: &PgPool,
+    task_id: TaskId,
+    file_id: TaskAttachmentFileId,
+    actor: UserId,
+    metadata: serde_json::Value,
+) -> Result<TaskAttachment> {
+    let row = sqlx::query_as::<_, TaskAttachmentRow>(
+        r#"
+        WITH upserted AS (
+            INSERT INTO tasks.task_attachments (
+                task_id,
+                file_id,
+                added_by_user_id,
+                metadata
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (task_id, file_id)
+            DO UPDATE SET
+                added_by_user_id = EXCLUDED.added_by_user_id,
+                metadata = EXCLUDED.metadata,
+                deleted_at = NULL
+            RETURNING
+                task_id,
+                file_id,
+                added_by_user_id,
+                metadata,
+                created_at
+        )
+        SELECT
+            upserted.task_id,
+            upserted.file_id,
+            upserted.added_by_user_id,
+            added_by.username AS added_by_username,
+            upserted.metadata,
+            upserted.created_at
+        FROM upserted
+        LEFT JOIN auth.users added_by
+          ON added_by.id = upserted.added_by_user_id
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(file_id.0)
+    .bind(actor.0)
+    .bind(metadata)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| db_err("Failed to upsert task attachment", err))?;
+
+    Ok(to_task_attachment(row))
+}
+
+async fn list_task_attachments(
+    pool: &PgPool,
+    task_id: TaskId,
+    limit: i64,
+) -> Result<Vec<TaskAttachment>> {
+    let rows = sqlx::query_as::<_, TaskAttachmentRow>(
+        r#"
+        SELECT
+            ta.task_id,
+            ta.file_id,
+            ta.added_by_user_id,
+            added_by.username AS added_by_username,
+            ta.metadata,
+            ta.created_at
+        FROM tasks.task_attachments ta
+        LEFT JOIN auth.users added_by
+          ON added_by.id = ta.added_by_user_id
+        WHERE ta.task_id = $1
+          AND ta.deleted_at IS NULL
+        ORDER BY ta.created_at ASC, ta.file_id ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| db_err("Failed to query task attachments", err))?;
+
+    Ok(rows.into_iter().map(to_task_attachment).collect())
+}
+
+async fn remove_task_attachment(
+    pool: &PgPool,
+    task_id: TaskId,
+    file_id: TaskAttachmentFileId,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE tasks.task_attachments
+        SET
+            deleted_at = CURRENT_TIMESTAMP
+        WHERE task_id = $1
+          AND file_id = $2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(task_id.0)
+    .bind(file_id.0)
+    .execute(pool)
+    .await
+    .map_err(|err| db_err("Failed to remove task attachment", err))?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 async fn get_task_log_entries(
@@ -1292,8 +1615,11 @@ pub use projects::{
     list_projects_with_roles, update_project_with_roles,
 };
 pub use tasks::{
-    create_task_comment_with_roles, create_task_link_with_roles, create_task_with_roles,
-    delete_task_links_with_roles, delete_task_with_roles, get_task_log_with_roles,
-    get_task_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
-    task_cascade_impact_with_roles, transition_task_with_roles, update_task_with_roles,
+    create_task_attachment_with_roles, create_task_comment_with_roles, create_task_link_with_roles,
+    create_task_with_roles, delete_task_attachment_with_roles, delete_task_comment_with_roles,
+    delete_task_links_with_roles, delete_task_with_roles, export_task_markdown_with_roles,
+    get_task_by_ref_with_roles, get_task_log_with_roles, get_task_with_roles,
+    list_task_attachments_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
+    task_cascade_impact_with_roles, transition_task_with_roles, update_task_comment_with_roles,
+    update_task_with_roles,
 };

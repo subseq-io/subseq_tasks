@@ -13,24 +13,29 @@ pub mod prelude {
     pub use crate::api::{HasPool, TasksApp};
     #[cfg(feature = "sqlx")]
     pub use crate::db::{
-        create_milestone_with_roles, create_project_with_roles, create_task_comment_with_roles,
-        create_task_link_with_roles, create_task_tables, create_task_with_roles,
-        delete_milestone_with_roles, delete_project_with_roles, delete_task_links_with_roles,
-        delete_task_with_roles, get_milestone_with_roles, get_project_with_roles,
+        create_milestone_with_roles, create_project_with_roles, create_task_attachment_with_roles,
+        create_task_comment_with_roles, create_task_link_with_roles, create_task_tables,
+        create_task_with_roles, delete_milestone_with_roles, delete_project_with_roles,
+        delete_task_attachment_with_roles, delete_task_comment_with_roles,
+        delete_task_links_with_roles, delete_task_with_roles, export_task_markdown_with_roles,
+        get_milestone_with_roles, get_project_with_roles, get_task_by_ref_with_roles,
         get_task_log_with_roles, get_task_with_roles, list_milestones_with_roles,
-        list_projects_with_roles, list_task_comments_with_roles, list_tasks_with_roles,
-        task_cascade_impact_with_roles, transition_task_with_roles, update_milestone_with_roles,
-        update_project_with_roles, update_task_with_roles,
+        list_projects_with_roles, list_task_attachments_with_roles, list_task_comments_with_roles,
+        list_tasks_with_roles, task_cascade_impact_with_roles, transition_task_with_roles,
+        update_milestone_with_roles, update_project_with_roles, update_task_comment_with_roles,
+        update_task_with_roles,
     };
     pub use crate::error::{ErrorKind, LibError, Result};
     pub use crate::models::{
         CreateMilestonePayload, CreateProjectPayload, CreateTaskCommentPayload,
         CreateTaskLinkPayload, CreateTaskPayload, DeadlineSource, ListMilestonesQuery, ListQuery,
         ListTasksQuery, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
-        ProjectSummary, RepeatSchema, Task, TaskCascadeImpact, TaskCascadeImpactQuery,
-        TaskCascadeOperation, TaskComment, TaskCommentId, TaskDetails, TaskGraphAssignment, TaskId,
-        TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskState, TimelineSource,
-        TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload, UpdateTaskPayload,
+        ProjectSummary, RepeatSchema, Task, TaskAttachment, TaskAttachmentFileId,
+        TaskCascadeImpact, TaskCascadeImpactQuery, TaskCascadeOperation, TaskComment,
+        TaskCommentId, TaskDetails, TaskFilterRule, TaskGraphAssignment, TaskId, TaskLink,
+        TaskLinkType, TaskLogEntry, TaskLogId, TaskOrderBy, TaskState, TimelineSource,
+        TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload,
+        UpdateTaskCommentPayload, UpdateTaskPayload,
     };
     pub use crate::permissions::{
         access_roles, full_permissions, milestone_create, milestone_delete, milestone_read,

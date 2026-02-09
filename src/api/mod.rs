@@ -53,13 +53,19 @@ where
     tracing::info!("Registering route /milestone [GET,POST]");
     tracing::info!("Registering route /milestone/{{milestone_id}} [GET,PUT,DELETE]");
     tracing::info!("Registering route /task [GET,POST]");
+    tracing::info!("Registering route /task/list [GET]");
     tracing::info!("Registering route /task/{{task_id}} [GET,PUT,DELETE]");
     tracing::info!("Registering route /task/{{task_id}}/link [POST]");
     tracing::info!("Registering route /task/{{task_id}}/comments [GET,POST]");
+    tracing::info!("Registering route /task/{{task_id}}/comments/{{comment_id}} [PUT,DELETE]");
+    tracing::info!("Registering route /task/{{task_id}}/attachment/{{file_id}} [POST,DELETE]");
+    tracing::info!("Registering route /task/{{task_id}}/attachment/list [GET]");
     tracing::info!("Registering route /task/{{task_id}}/impact [GET]");
     tracing::info!("Registering route /task/{{task_id}}/link/{{other_task_id}} [DELETE]");
     tracing::info!("Registering route /task/{{task_id}}/log [GET]");
     tracing::info!("Registering route /task/{{task_id}}/transition [POST]");
+    tracing::info!("Registering route /task/{{task_id}}/export [GET]");
+    tracing::info!("Registering route /task/{{task_id}}/export/markdown [GET]");
 
     Router::new()
         .merge(projects::routes::<S>())

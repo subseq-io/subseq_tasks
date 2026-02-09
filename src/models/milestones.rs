@@ -82,6 +82,8 @@ pub struct Milestone {
     pub repeat_interval_seconds: Option<i64>,
     pub repeat_end: Option<NaiveDateTime>,
     pub repeat_schema: Option<RepeatSchema>,
+    pub next_milestone_id: Option<MilestoneId>,
+    pub previous_milestone_id: Option<MilestoneId>,
     pub metadata: Value,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -92,6 +94,8 @@ pub struct Milestone {
 pub struct ListMilestonesQuery {
     pub project_id: Option<ProjectId>,
     pub completed: Option<bool>,
+    pub query: Option<String>,
+    pub due: Option<DateTime<Utc>>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
 }
@@ -119,6 +123,8 @@ pub struct CreateMilestonePayload {
     pub repeat_interval_seconds: Option<i64>,
     pub repeat_end: Option<DateTime<Utc>>,
     pub repeat_schema: Option<RepeatSchema>,
+    pub next_milestone_id: Option<MilestoneId>,
+    pub previous_milestone_id: Option<MilestoneId>,
     pub metadata: Option<Value>,
 }
 
@@ -139,5 +145,9 @@ pub struct UpdateMilestonePayload {
     pub clear_repeat: Option<bool>,
     pub repeat_end: Option<DateTime<Utc>>,
     pub repeat_schema: Option<RepeatSchema>,
+    pub next_milestone_id: Option<MilestoneId>,
+    pub clear_next_milestone: Option<bool>,
+    pub previous_milestone_id: Option<MilestoneId>,
+    pub clear_previous_milestone: Option<bool>,
     pub metadata: Option<Value>,
 }
