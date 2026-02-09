@@ -60,7 +60,7 @@ where
         &task.project_ids,
         task.task.id,
         auth_user.id(),
-        TaskUpdate::TaskCreated {
+        TaskUpdate::TaskCreate {
             payload: payload_for_event,
         },
     )
@@ -123,15 +123,29 @@ where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
     let payload_for_event = payload.clone();
+    let existing = db::get_task_with_roles(&app.pool(), auth_user.id(), task_id).await?;
     let task = db::update_task_with_roles(&app.pool(), auth_user.id(), task_id, payload).await?;
+    let task_update = if existing.task.archived != task.task.archived {
+        if task.task.archived {
+            TaskUpdate::TaskArchive {
+                payload: payload_for_event,
+            }
+        } else {
+            TaskUpdate::TaskUnarchive {
+                payload: payload_for_event,
+            }
+        }
+    } else {
+        TaskUpdate::TaskUpdated {
+            payload: payload_for_event,
+        }
+    };
     emit_task_update(
         &app,
         &task.project_ids,
         task.task.id,
         auth_user.id(),
-        TaskUpdate::TaskUpdated {
-            payload: payload_for_event,
-        },
+        task_update,
     )
     .await?;
     Ok(Json(task))

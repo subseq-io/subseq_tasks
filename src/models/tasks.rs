@@ -349,8 +349,10 @@ pub struct UpdateTaskCommentPayload {
 
 #[derive(Debug, Clone)]
 pub enum TaskUpdate {
-    TaskCreated { payload: CreateTaskPayload },
+    TaskCreate { payload: CreateTaskPayload },
     TaskUpdated { payload: UpdateTaskPayload },
+    TaskArchive { payload: UpdateTaskPayload },
+    TaskUnarchive { payload: UpdateTaskPayload },
     TaskDeleted,
     TaskTransitioned { payload: TransitionTaskPayload },
     TaskLinkCreated { payload: CreateTaskLinkPayload },

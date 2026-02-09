@@ -19,8 +19,10 @@ Arguments:
 
 `TaskUpdate` variants represent mutation classes:
 
-- `TaskCreated`
+- `TaskCreate`
 - `TaskUpdated`
+- `TaskArchive`
+- `TaskUnarchive`
 - `TaskDeleted`
 - `TaskTransitioned`
 - `TaskLinkCreated`

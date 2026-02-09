@@ -229,8 +229,10 @@ Trait method:
 
 Hook payload enum:
 
-- `TaskUpdate::TaskCreated { payload }`
+- `TaskUpdate::TaskCreate { payload }`
 - `TaskUpdate::TaskUpdated { payload }`
+- `TaskUpdate::TaskArchive { payload }`
+- `TaskUpdate::TaskUnarchive { payload }`
 - `TaskUpdate::TaskDeleted`
 - `TaskUpdate::TaskTransitioned { payload }`
 - `TaskUpdate::TaskLinkCreated { payload }`
