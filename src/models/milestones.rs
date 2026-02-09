@@ -96,6 +96,8 @@ pub struct ListMilestonesQuery {
     pub completed: Option<bool>,
     pub query: Option<String>,
     pub due: Option<DateTime<Utc>>,
+    pub due_start: Option<DateTime<Utc>>,
+    pub due_end: Option<DateTime<Utc>>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
 }
@@ -150,4 +152,11 @@ pub struct UpdateMilestonePayload {
     pub previous_milestone_id: Option<MilestoneId>,
     pub clear_previous_milestone: Option<bool>,
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MilestoneUpdate {
+    MilestoneCreate { payload: CreateMilestonePayload },
+    MilestoneUpdated { payload: UpdateMilestonePayload },
+    MilestoneArchive,
 }

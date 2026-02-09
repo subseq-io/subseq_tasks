@@ -9,7 +9,7 @@ use subseq_auth::prelude::ValidatesIdentity;
 use subseq_auth::user_id::UserId;
 
 use crate::error::{ErrorKind, LibError};
-use crate::models::{ProjectId, TaskId, TaskUpdate};
+use crate::models::{MilestoneId, MilestoneUpdate, ProjectId, ProjectUpdate, TaskId, TaskUpdate};
 
 mod milestones;
 mod projects;
@@ -46,8 +46,31 @@ pub trait HasPool {
 
 pub type TaskUpdateHookFuture<'a> =
     Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + 'a>>;
+pub type ProjectUpdateHookFuture<'a> =
+    Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + 'a>>;
+pub type MilestoneUpdateHookFuture<'a> =
+    Pin<Box<dyn Future<Output = crate::error::Result<()>> + Send + 'a>>;
 
 pub trait TasksApp: HasPool + ValidatesIdentity {
+    fn on_project_update(
+        &self,
+        _project_id: ProjectId,
+        _actor_id: UserId,
+        _project_update: ProjectUpdate,
+    ) -> ProjectUpdateHookFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn on_milestone_update(
+        &self,
+        _project_id: ProjectId,
+        _milestone_id: MilestoneId,
+        _actor_id: UserId,
+        _milestone_update: MilestoneUpdate,
+    ) -> MilestoneUpdateHookFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn on_task_update(
         &self,
         _project_id: ProjectId,

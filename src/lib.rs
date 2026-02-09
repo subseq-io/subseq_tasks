@@ -10,7 +10,9 @@ pub mod test_harness;
 
 pub mod prelude {
     #[cfg(feature = "api")]
-    pub use crate::api::{HasPool, TaskUpdateHookFuture, TasksApp};
+    pub use crate::api::{
+        HasPool, MilestoneUpdateHookFuture, ProjectUpdateHookFuture, TaskUpdateHookFuture, TasksApp,
+    };
     #[cfg(feature = "sqlx")]
     pub use crate::db::{
         create_milestone_with_roles, create_project_with_roles, create_task_attachment_with_roles,
@@ -29,12 +31,12 @@ pub mod prelude {
     pub use crate::models::{
         CreateMilestonePayload, CreateProjectPayload, CreateTaskCommentPayload,
         CreateTaskLinkPayload, CreateTaskPayload, DeadlineSource, ListMilestonesQuery, ListQuery,
-        ListTasksQuery, Milestone, MilestoneId, MilestoneType, Paged, Project, ProjectId,
-        ProjectSummary, RepeatSchema, Task, TaskAttachment, TaskAttachmentFileId,
-        TaskCascadeImpact, TaskCascadeImpactQuery, TaskCascadeOperation, TaskComment,
-        TaskCommentId, TaskDetails, TaskFilterRule, TaskGraphAssignment, TaskId, TaskLink,
-        TaskLinkType, TaskLogEntry, TaskLogId, TaskOrderBy, TaskState, TaskUpdate, TimelineSource,
-        TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload,
+        ListTasksQuery, Milestone, MilestoneId, MilestoneType, MilestoneUpdate, Paged, Project,
+        ProjectId, ProjectSummary, ProjectUpdate, RepeatSchema, Task, TaskAttachment,
+        TaskAttachmentFileId, TaskCascadeImpact, TaskCascadeImpactQuery, TaskCascadeOperation,
+        TaskComment, TaskCommentId, TaskDetails, TaskFilterRule, TaskGraphAssignment, TaskId,
+        TaskLink, TaskLinkType, TaskLogEntry, TaskLogId, TaskOrderBy, TaskState, TaskUpdate,
+        TimelineSource, TransitionTaskPayload, UpdateMilestonePayload, UpdateProjectPayload,
         UpdateTaskCommentPayload, UpdateTaskPayload,
     };
     pub use crate::permissions::{

@@ -8,7 +8,9 @@ use axum::{
 use subseq_auth::prelude::AuthenticatedUser;
 
 use crate::db;
-use crate::models::{CreateProjectPayload, ListQuery, ProjectId, UpdateProjectPayload};
+use crate::models::{
+    CreateProjectPayload, ListQuery, ProjectId, ProjectUpdate, UpdateProjectPayload,
+};
 
 use super::{AppError, TasksApp};
 
@@ -20,7 +22,16 @@ async fn create_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let project = db::create_project_with_roles(&app.pool(), auth_user.id(), payload).await?;
+    app.on_project_update(
+        project.id,
+        auth_user.id(),
+        ProjectUpdate::ProjectCreate {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -58,8 +69,17 @@ async fn update_project_handler<S>(
 where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
+    let payload_for_event = payload.clone();
     let project =
         db::update_project_with_roles(&app.pool(), auth_user.id(), project_id, payload).await?;
+    app.on_project_update(
+        project.id,
+        auth_user.id(),
+        ProjectUpdate::ProjectUpdated {
+            payload: payload_for_event,
+        },
+    )
+    .await?;
     Ok(Json(project))
 }
 
@@ -72,6 +92,8 @@ where
     S: TasksApp + Clone + Send + Sync + 'static,
 {
     db::delete_project_with_roles(&app.pool(), auth_user.id(), project_id).await?;
+    app.on_project_update(project_id, auth_user.id(), ProjectUpdate::ProjectArchive)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

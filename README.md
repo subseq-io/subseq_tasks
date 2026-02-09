@@ -175,6 +175,13 @@ Milestones now expose recurrence linkage fields:
 
 Both fields are constrained to milestones inside the same project.
 
+Milestone list now supports due-date range filtering:
+
+- `dueStart`: include milestones with `dueDate >= dueStart`
+- `dueEnd`: include milestones with `dueDate <= dueEnd`
+
+If both are provided, `dueStart` must be earlier than or equal to `dueEnd`.
+
 ## Task Graph Permission Coupling
 
 When task/project operations read or validate underlying graphs, this crate also enforces graph access via `subseq_graph` using `graph_read_access_roles()`.
@@ -219,15 +226,29 @@ When assigning a permission for a group, create `auth.group_roles` entries for o
 
 Use whichever scope granularity you need.
 
-## Task Update Hook
+## Mutation Hooks
 
-`TasksApp` now exposes a task-update hook so applications can react to task mutations.
+`TasksApp` exposes hooks so applications can react to project, milestone, and task mutations.
 
-Trait method:
+Trait methods:
 
+- `on_project_update(project_id, actor_id, project_update)`
+- `on_milestone_update(project_id, milestone_id, actor_id, milestone_update)`
 - `on_task_update(project_id, task_id, actor_id, task_update)`
 
-Hook payload enum:
+Project hook payloads:
+
+- `ProjectUpdate::ProjectCreate { payload }`
+- `ProjectUpdate::ProjectUpdated { payload }`
+- `ProjectUpdate::ProjectArchive`
+
+Milestone hook payloads:
+
+- `MilestoneUpdate::MilestoneCreate { payload }`
+- `MilestoneUpdate::MilestoneUpdated { payload }`
+- `MilestoneUpdate::MilestoneArchive`
+
+Task hook payloads:
 
 - `TaskUpdate::TaskCreate { payload }`
 - `TaskUpdate::TaskUpdated { payload }`
@@ -243,4 +264,4 @@ Hook payload enum:
 - `TaskUpdate::TaskAttachmentAdded { file_id }`
 - `TaskUpdate::TaskAttachmentRemoved { file_id }`
 
-The hook is invoked after successful task mutation handlers and is emitted once per project associated with the task.
+Hooks are invoked after successful mutation handlers.

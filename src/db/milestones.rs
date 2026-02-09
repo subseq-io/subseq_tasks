@@ -152,7 +152,8 @@ pub async fn list_milestones_with_roles(
     project_id: Option<ProjectId>,
     completed: Option<bool>,
     query: Option<String>,
-    due: Option<chrono::NaiveDateTime>,
+    due_start: Option<chrono::NaiveDateTime>,
+    due_end: Option<chrono::NaiveDateTime>,
     page: u32,
     limit: u32,
 ) -> Result<Paged<Milestone>> {
@@ -219,8 +220,9 @@ pub async fn list_milestones_with_roles(
               OR milestone_type ILIKE $5
           )
           AND ($6::timestamp IS NULL OR due_date >= $6)
+          AND ($7::timestamp IS NULL OR due_date <= $7)
         ORDER BY due_date ASC NULLS LAST, created_at DESC, id DESC
-        LIMIT $7 OFFSET $8
+        LIMIT $8 OFFSET $9
         "#,
     )
     .bind(&allowed_project_ids)
@@ -228,7 +230,8 @@ pub async fn list_milestones_with_roles(
     .bind(completed)
     .bind(search_query)
     .bind(search_like)
-    .bind(due)
+    .bind(due_start)
+    .bind(due_end)
     .bind(limit as i64)
     .bind(offset)
     .fetch_all(pool)

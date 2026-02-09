@@ -71,3 +71,10 @@ pub struct UpdateProjectPayload {
     pub clear_task_graph: Option<bool>,
     pub metadata: Option<Value>,
 }
+
+#[derive(Debug, Clone)]
+pub enum ProjectUpdate {
+    ProjectCreate { payload: CreateProjectPayload },
+    ProjectUpdated { payload: UpdateProjectPayload },
+    ProjectArchive,
+}
