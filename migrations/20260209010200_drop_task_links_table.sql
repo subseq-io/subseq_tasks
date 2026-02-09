@@ -1,5 +1,14 @@
 DROP VIEW IF EXISTS tasks.task_presentation;
 
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM tasks.task_links LIMIT 1) THEN
+        RAISE EXCEPTION
+            'Cannot drop tasks.task_links while rows exist; migrate legacy task_links data into graph storage first.';
+    END IF;
+END;
+$$;
+
 DROP TABLE IF EXISTS tasks.task_links;
 
 CREATE VIEW tasks.task_presentation AS
