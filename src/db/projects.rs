@@ -69,6 +69,8 @@ pub async fn create_project_with_roles(
     .await
     .map_err(|err| db_err("Failed to create project", err))?;
 
+    super::tasks::initialize_project_link_graphs_if_missing(pool, actor, project_id).await?;
+
     get_project_with_roles(pool, actor, project_id).await
 }
 

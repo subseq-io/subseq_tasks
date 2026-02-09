@@ -25,6 +25,7 @@ impl From<LibError> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = match self.0.kind {
+            ErrorKind::Conflict => StatusCode::CONFLICT,
             ErrorKind::Database => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorKind::Forbidden => StatusCode::FORBIDDEN,
             ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,

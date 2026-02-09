@@ -2,6 +2,7 @@ use anyhow::Error as AnyError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    Conflict,
     Database,
     Forbidden,
     InvalidInput,
@@ -17,6 +18,14 @@ pub struct LibError {
 }
 
 impl LibError {
+    pub fn conflict<S: Into<String>>(public: S, source: AnyError) -> Self {
+        Self {
+            kind: ErrorKind::Conflict,
+            public: public.into(),
+            source,
+        }
+    }
+
     pub fn database<S: Into<String>>(public: S, source: AnyError) -> Self {
         Self {
             kind: ErrorKind::Database,
@@ -63,6 +72,7 @@ pub type Result<T> = std::result::Result<T, LibError>;
 impl From<subseq_graph::error::LibError> for LibError {
     fn from(value: subseq_graph::error::LibError) -> Self {
         let kind = match value.kind {
+            subseq_graph::error::ErrorKind::Conflict => ErrorKind::Conflict,
             subseq_graph::error::ErrorKind::Database => ErrorKind::Database,
             subseq_graph::error::ErrorKind::Forbidden => ErrorKind::Forbidden,
             subseq_graph::error::ErrorKind::InvalidInput => ErrorKind::InvalidInput,

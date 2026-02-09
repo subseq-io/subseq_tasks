@@ -64,13 +64,13 @@ Transitions apply structured side effects:
 
 ## Subtasks By Parent State
 
-`tasks.task_links` supports `subtask_parent_state` for `subtask_of` links so subtasks can be tied to a specific parent workflow state.
+`subtask_of` edges persist `subtask_parent_state` in graph edge metadata so subtasks can be tied to a specific parent workflow state.
 
-For non-`subtask_of` links, `subtask_parent_state` must be null.
+For non-`subtask_of` links, this metadata field is unset.
 
 ## Link Graph Constraints
 
-Task links are validated per shared project using `subseq_graph` invariants before writes:
+Task links are stored per project in graph-backed layers (`tasks.project_link_graphs` + `tasks.task_link_graph_nodes`) and validated with `subseq_graph` invariants before writes:
 
 - `subtask_of` is validated as a project-level forest modeled as a tree with a synthetic project-root node.
 - `depends_on` is validated as a DAG.
@@ -107,7 +107,9 @@ The view pre-joins and aggregates:
 - Usernames for task actors (`author`, `assignee`, `completed_by`) and comment/log actors.
 - Milestone display fields (`milestone_name`, `milestone_type`).
 - Project summaries and project IDs for the task.
-- Task-adjacent tables (`task_graph_assignments`, `task_links`, `task_comments`, `task_log`) as JSON arrays.
+- Task-adjacent tables (`task_graph_assignments`, `task_comments`, `task_log`) as JSON arrays.
+
+Task link arrays are assembled from graph storage at read time after graph read-access checks.
 
 `GET /task/{task_id}` reads from this view to assemble the details response in one DB query path after authorization.
 

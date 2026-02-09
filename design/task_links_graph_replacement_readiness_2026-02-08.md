@@ -13,14 +13,16 @@ Relationship layers:
 - `depends_on` -> DAG
 - `related_to` / `assignment_order` -> directed
 
-## Current Reality
+## Current Reality (2026-02-08 snapshot)
 
-`tasks.task_links` is currently authoritative for:
+`tasks.task_links` was authoritative at this snapshot for:
 - link create/delete APIs
 - task details (`links_out`, `links_in`)
 - subtree queries for archive/unarchive/delete/impact
 
-`subseq_graph` is currently used as an invariant engine (projection validation), not as task-link storage.
+`subseq_graph` was used as an invariant engine (projection validation), not as task-link storage.
+
+This section is historical; see `Implementation Status (2026-02-09)` for the current state.
 
 ## Reassessment After Graph Delta/Reparent Updates
 
@@ -114,3 +116,23 @@ Recommended path:
 2. Use delta ops for add/remove and `reparent_node` for subtask parent changes across mirrored project graphs.
 3. Switch read paths (`links_out`, `links_in`, subtree impact/cascade) to graph-backed queries once parity checks pass.
 4. Remove `tasks.task_links` once graph-backed behavior is stable under archive/unarchive/delete/reparent flows.
+
+Status: completed on 2026-02-09 (see section below).
+
+## Implementation Status (2026-02-09)
+
+Implemented in `/Users/teague/Subsequent/backend/subseq_tasks`:
+- Added graph mapping tables:
+  - `tasks.project_link_graphs` (per-project/per-link-type graph bindings)
+  - `tasks.task_link_graph_nodes` (task-to-node mappings)
+  - Migration: `migrations/20260209010100_task_link_graph_storage.sql`
+- Switched task link operations to graph APIs:
+  - create/delete link paths use `upsert_edge_metadata` / `remove_edge` / `reparent_node`
+  - task detail link hydration (`links_out`, `links_in`) is rebuilt from graph edges
+  - subtree traversal for impact/cascade uses graph-backed subtask edges
+- Initialized project link graphs at project creation and materialized task nodes at task creation.
+- Removed legacy table authority:
+  - dropped `tasks.task_links`
+  - refreshed `tasks.task_presentation` without table dependency
+  - migration: `migrations/20260209010200_drop_task_links_table.sql`
+- Verified by test run: `cargo test` (9 passed, 0 failed).

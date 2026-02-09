@@ -184,15 +184,6 @@ struct TaskPresentationRow {
 }
 
 #[derive(Debug, Clone, FromRow)]
-struct TaskLinkRow {
-    task_from_id: Uuid,
-    task_to_id: Uuid,
-    link_type: String,
-    subtask_parent_state: Option<String>,
-    created_at: chrono::NaiveDateTime,
-}
-
-#[derive(Debug, Clone, FromRow)]
 struct TaskCommentRow {
     id: Uuid,
     task_id: Uuid,
@@ -424,21 +415,6 @@ fn to_task(row: TaskRow) -> Result<Task> {
         metadata: row.metadata,
         created_at: row.created_at,
         updated_at: row.updated_at,
-    })
-}
-
-fn to_task_link(row: TaskLinkRow) -> Result<TaskLink> {
-    Ok(TaskLink {
-        task_from_id: TaskId(row.task_from_id),
-        task_to_id: TaskId(row.task_to_id),
-        link_type: task_link_type_from_row(&row.link_type)?,
-        subtask_parent_state: row
-            .subtask_parent_state
-            .as_deref()
-            .map(task_state_from_row)
-            .transpose()?,
-        other_task_title: None,
-        created_at: row.created_at,
     })
 }
 

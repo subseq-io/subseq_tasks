@@ -1,14 +1,217 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use serde_json::json;
-use subseq_graph::invariants::{GraphMutationIndex, graph_invariant_violations};
-use subseq_graph::models::{GraphEdge, GraphInvariantViolation, GraphKind, GraphNode, GraphNodeId};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use subseq_graph::db as graph_db;
+use subseq_graph::invariants::graph_invariant_violations;
+use subseq_graph::models::{
+    GraphInvariantViolation, GraphKind, GraphNodeId, NewGraphNode, RemoveEdgePayload,
+    ReparentNodePayload, UpsertEdgeMetadataPayload, UpsertNodePayload,
+};
 
 use super::*;
 
 const TASK_DETAILS_LIMIT: i64 = 200;
 const SUBTREE_MAX_TASKS: usize = 20_000;
+const TASK_LINK_TYPES: [TaskLinkType; 4] = [
+    TaskLinkType::SubtaskOf,
+    TaskLinkType::DependsOn,
+    TaskLinkType::RelatedTo,
+    TaskLinkType::AssignmentOrder,
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectLinkGraphBinding {
+    project_id: ProjectId,
+    link_type: TaskLinkType,
+    graph_id: GraphId,
+    root_node_id: Option<GraphNodeId>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProjectLinkGraphRow {
+    link_type: String,
+    graph_id: Uuid,
+    root_node_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TaskLinkGraphNodeRow {
+    node_id: Uuid,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct GraphEdgeMetadataRow {
+    created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct GraphIncidentLinkRow {
+    metadata: serde_json::Value,
+    created_at: chrono::NaiveDateTime,
+    from_metadata: serde_json::Value,
+    to_metadata: serde_json::Value,
+    from_title: Option<String>,
+    to_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskLinkNodeApiMetadata {
+    project_id: String,
+    link_type: String,
+    synthetic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct TaskLinkNodeDbMetadata {
+    project_id: String,
+    link_type: String,
+    synthetic: bool,
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskLinkEdgeApiMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtask_parent_state: Option<String>,
+    #[serde(default)]
+    synthetic_root_edge: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct TaskLinkEdgeDbMetadata {
+    #[serde(default)]
+    subtask_parent_state: Option<String>,
+    #[serde(default)]
+    synthetic_root_edge: bool,
+}
+
+fn serialize_metadata<T: Serialize>(value: T, context: &'static str) -> Result<Value> {
+    serde_json::to_value(value).map_err(|err| {
+        LibError::invalid(
+            "Invalid metadata payload",
+            anyhow!("failed to serialize {context} metadata: {err}"),
+        )
+    })
+}
+
+fn deserialize_metadata<T: DeserializeOwned>(value: &Value, context: &'static str) -> Result<T> {
+    serde_json::from_value::<T>(value.clone()).map_err(|err| {
+        LibError::database(
+            "Failed to decode graph metadata",
+            anyhow!("failed to decode {context} metadata: {err}; payload={value}"),
+        )
+    })
+}
+
+fn storage_graph_kind_for_link(link_type: TaskLinkType) -> GraphKind {
+    match link_type {
+        // Tree-kind graphs cannot incrementally add disconnected task nodes with current graph APIs.
+        // We store subtask edges in a DAG graph and enforce rooted-tree semantics at mutation boundaries.
+        TaskLinkType::SubtaskOf => GraphKind::Dag,
+        TaskLinkType::DependsOn => GraphKind::Dag,
+        TaskLinkType::RelatedTo | TaskLinkType::AssignmentOrder => GraphKind::Directed,
+    }
+}
+
+fn synthetic_root_label_for_link(link_type: TaskLinkType) -> &'static str {
+    match link_type {
+        TaskLinkType::SubtaskOf => "subtask_root",
+        TaskLinkType::DependsOn => "depends_anchor",
+        TaskLinkType::RelatedTo => "related_anchor",
+        TaskLinkType::AssignmentOrder => "assignment_anchor",
+    }
+}
+
+fn task_node_api_metadata(
+    project_id: ProjectId,
+    link_type: TaskLinkType,
+    task_id: TaskId,
+) -> Result<Value> {
+    serialize_metadata(
+        TaskLinkNodeApiMetadata {
+            project_id: project_id.0.to_string(),
+            link_type: link_type.as_db_value().to_string(),
+            synthetic: false,
+            external_id: Some(task_id.0.to_string()),
+            task_id: Some(task_id.0.to_string()),
+        },
+        "task-link node (api)",
+    )
+}
+
+fn synthetic_node_api_metadata(project_id: ProjectId, link_type: TaskLinkType) -> Result<Value> {
+    serialize_metadata(
+        TaskLinkNodeApiMetadata {
+            project_id: project_id.0.to_string(),
+            link_type: link_type.as_db_value().to_string(),
+            synthetic: true,
+            external_id: None,
+            task_id: None,
+        },
+        "task-link synthetic node (api)",
+    )
+}
+
+fn synthetic_root_edge_api_metadata() -> Result<Value> {
+    serialize_metadata(
+        TaskLinkEdgeApiMetadata {
+            synthetic_root_edge: true,
+            ..TaskLinkEdgeApiMetadata::default()
+        },
+        "task-link synthetic root edge (api)",
+    )
+}
+
+fn subtask_parent_edge_api_metadata(state: TaskState) -> Result<Value> {
+    serialize_metadata(
+        TaskLinkEdgeApiMetadata {
+            subtask_parent_state: Some(state.as_str().to_string()),
+            ..TaskLinkEdgeApiMetadata::default()
+        },
+        "task-link subtask parent edge (api)",
+    )
+}
+
+fn default_edge_api_metadata() -> Result<Value> {
+    serialize_metadata(TaskLinkEdgeApiMetadata::default(), "task-link edge (api)")
+}
+
+fn parse_task_id_from_node_metadata(value: &Value) -> Result<Option<TaskId>> {
+    let metadata: TaskLinkNodeDbMetadata = deserialize_metadata(value, "task-link node (db)")?;
+    let Some(external_id) = metadata.external_id else {
+        return Ok(None);
+    };
+    let uuid = Uuid::parse_str(&external_id).map_err(|err| {
+        LibError::database(
+            "Failed to decode graph node external_id",
+            anyhow!("invalid external_id uuid '{external_id}' in graph metadata: {err}"),
+        )
+    })?;
+    Ok(Some(TaskId(uuid)))
+}
+
+fn parse_subtask_parent_state_from_edge_metadata(value: &Value) -> Result<Option<TaskState>> {
+    let metadata: TaskLinkEdgeDbMetadata = deserialize_metadata(value, "task-link edge (db)")?;
+    metadata
+        .subtask_parent_state
+        .as_deref()
+        .map(task_state_from_row)
+        .transpose()
+}
 
 fn graph_violation_values(violations: &[GraphInvariantViolation]) -> serde_json::Value {
     json!(
@@ -19,131 +222,376 @@ fn graph_violation_values(violations: &[GraphInvariantViolation]) -> serde_json:
     )
 }
 
-fn task_node(task_id: TaskId) -> GraphNode {
-    GraphNode {
-        id: GraphNodeId(task_id.0),
-        label: task_id.0.to_string(),
-        metadata: json!({ "taskId": task_id.0 }),
-    }
-}
-
-fn task_edge(from: TaskId, to: TaskId) -> GraphEdge {
-    GraphEdge {
-        from_node_id: GraphNodeId(from.0),
-        to_node_id: GraphNodeId(to.0),
-        metadata: json!({}),
-    }
-}
-
-fn synthetic_project_root_node(task_ids: &[TaskId]) -> GraphNodeId {
-    let mut task_id_set = HashSet::with_capacity(task_ids.len());
-    for task_id in task_ids {
-        task_id_set.insert(task_id.0);
-    }
-
-    let mut root = Uuid::new_v4();
-    while task_id_set.contains(&root) {
-        root = Uuid::new_v4();
-    }
-
-    GraphNodeId(root)
-}
-
-fn build_project_subtask_tree_graph(
+async fn load_project_link_graph_bindings<'e, E>(
+    executor: E,
     project_id: ProjectId,
-    task_ids: &[TaskId],
-    subtask_edges: &[(TaskId, TaskId)],
-) -> (Vec<GraphNode>, Vec<GraphEdge>, GraphNodeId) {
-    let _ = project_id;
-    let root_node_id = synthetic_project_root_node(task_ids);
-    let mut nodes = Vec::with_capacity(task_ids.len() + 1);
-    nodes.push(GraphNode {
-        id: root_node_id,
-        label: "project_root".to_string(),
-        metadata: json!({ "synthetic": true }),
-    });
+) -> Result<HashMap<TaskLinkType, ProjectLinkGraphBinding>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let rows = sqlx::query_as::<_, ProjectLinkGraphRow>(
+        r#"
+        SELECT link_type, graph_id, root_node_id
+        FROM tasks.project_link_graphs
+        WHERE project_id = $1
+        ORDER BY link_type ASC
+        "#,
+    )
+    .bind(project_id.0)
+    .fetch_all(executor)
+    .await
+    .map_err(|err| db_err("Failed to query project link graph bindings", err))?;
 
-    let mut task_set = HashSet::with_capacity(task_ids.len());
-    for task_id in task_ids {
-        task_set.insert(*task_id);
-        nodes.push(task_node(*task_id));
+    let mut bindings = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let link_type = task_link_type_from_row(&row.link_type)?;
+        bindings.insert(
+            link_type,
+            ProjectLinkGraphBinding {
+                project_id,
+                link_type,
+                graph_id: GraphId(row.graph_id),
+                root_node_id: row.root_node_id.map(GraphNodeId),
+            },
+        );
     }
 
-    let mut incoming_counts: HashMap<TaskId, usize> = HashMap::new();
-    let mut edges = Vec::with_capacity(subtask_edges.len() + task_ids.len());
-    for (from, to) in subtask_edges {
-        if task_set.contains(from) && task_set.contains(to) {
-            *incoming_counts.entry(*to).or_insert(0) += 1;
-            edges.push(task_edge(*from, *to));
-        }
+    Ok(bindings)
+}
+
+fn ensure_all_link_type_bindings_present(
+    bindings: &HashMap<TaskLinkType, ProjectLinkGraphBinding>,
+    project_id: ProjectId,
+) -> Result<()> {
+    let missing = TASK_LINK_TYPES
+        .iter()
+        .copied()
+        .filter(|link_type| !bindings.contains_key(link_type))
+        .map(|link_type| link_type.as_db_value().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
     }
 
-    for task_id in task_ids {
-        if incoming_counts.get(task_id).copied().unwrap_or(0) == 0 {
-            edges.push(GraphEdge {
+    Err(LibError::database(
+        "Project link graph bindings are missing",
+        anyhow!(
+            "project {project_id} missing link graph bindings for {:?}",
+            missing
+        ),
+    ))
+}
+
+pub(super) async fn initialize_project_link_graphs_if_missing(
+    pool: &PgPool,
+    actor: UserId,
+    project_id: ProjectId,
+) -> Result<()> {
+    let existing = load_project_link_graph_bindings(pool, project_id).await?;
+    if TASK_LINK_TYPES
+        .iter()
+        .all(|link_type| existing.contains_key(link_type))
+    {
+        return Ok(());
+    }
+
+    let Some(project) = load_project_row(pool, project_id).await? else {
+        return Err(LibError::not_found(
+            "Project not found",
+            anyhow!("project {project_id} not found while initializing link graphs"),
+        ));
+    };
+    let owner_group_id = project.owner_group_id.map(GroupId);
+    let missing = TASK_LINK_TYPES
+        .iter()
+        .copied()
+        .filter(|link_type| !existing.contains_key(link_type))
+        .collect::<Vec<_>>();
+
+    for link_type in missing {
+        let graph = graph_db::create_graph(
+            pool,
+            actor,
+            subseq_graph::models::CreateGraphPayload {
+                kind: storage_graph_kind_for_link(link_type),
+                name: format!("{}-{}", project.slug, link_type.as_db_value()),
+                description: Some(format!(
+                    "Task link graph ({}) for project {}",
+                    link_type.as_db_value(),
+                    project_id
+                )),
+                metadata: Some(serialize_metadata(
+                    TaskLinkNodeApiMetadata {
+                        project_id: project_id.0.to_string(),
+                        link_type: link_type.as_db_value().to_string(),
+                        synthetic: true,
+                        external_id: None,
+                        task_id: None,
+                    },
+                    "project link graph metadata",
+                )?),
+                owner_group_id,
+                nodes: vec![NewGraphNode {
+                    id: None,
+                    label: synthetic_root_label_for_link(link_type).to_string(),
+                    metadata: Some(synthetic_node_api_metadata(project_id, link_type)?),
+                }],
+                edges: vec![],
+            },
+            graph_perm::graph_create_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
+
+        let root_node_id = if link_type == TaskLinkType::SubtaskOf {
+            Some(
+                graph
+                    .nodes
+                    .first()
+                    .ok_or_else(|| {
+                        LibError::database(
+                            "Failed to initialize subtask root node",
+                            anyhow!("created graph {} has no seed node", graph.id),
+                        )
+                    })?
+                    .id
+                    .0,
+            )
+        } else {
+            None
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO tasks.project_link_graphs (
+                project_id,
+                link_type,
+                graph_id,
+                root_node_id
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (project_id, link_type)
+            DO NOTHING
+            "#,
+        )
+        .bind(project_id.0)
+        .bind(link_type.as_db_value())
+        .bind(graph.id.0)
+        .bind(root_node_id)
+        .execute(pool)
+        .await
+        .map_err(|err| db_err("Failed to persist project link graph binding", err))?;
+    }
+
+    Ok(())
+}
+
+async fn project_link_graph_bindings_for_actor(
+    pool: &PgPool,
+    actor: UserId,
+    project_id: ProjectId,
+) -> Result<HashMap<TaskLinkType, ProjectLinkGraphBinding>> {
+    initialize_project_link_graphs_if_missing(pool, actor, project_id).await?;
+    let bindings = load_project_link_graph_bindings(pool, project_id).await?;
+    ensure_all_link_type_bindings_present(&bindings, project_id)?;
+    Ok(bindings)
+}
+
+async fn node_id_for_task_link_graph_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: ProjectId,
+    link_type: TaskLinkType,
+    task_id: TaskId,
+) -> Result<Option<GraphNodeId>> {
+    let row = sqlx::query_as::<_, TaskLinkGraphNodeRow>(
+        r#"
+        SELECT node_id
+        FROM tasks.task_link_graph_nodes
+        WHERE project_id = $1
+          AND link_type = $2
+          AND task_id = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(project_id.0)
+    .bind(link_type.as_db_value())
+    .bind(task_id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|err| db_err("Failed to query task link graph node mapping", err))?;
+
+    Ok(row.map(|row| GraphNodeId(row.node_id)))
+}
+
+async fn ensure_task_node_in_link_graph_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pool: &PgPool,
+    actor: UserId,
+    binding: ProjectLinkGraphBinding,
+    task_id: TaskId,
+    task_title: &str,
+) -> Result<GraphNodeId> {
+    if let Some(node_id) =
+        node_id_for_task_link_graph_tx(tx, binding.project_id, binding.link_type, task_id).await?
+    {
+        graph_db::upsert_node_tx(
+            tx,
+            pool,
+            actor,
+            binding.graph_id,
+            UpsertNodePayload {
+                node_id: Some(node_id),
+                label: task_title.to_string(),
+                metadata: Some(task_node_api_metadata(
+                    binding.project_id,
+                    binding.link_type,
+                    task_id,
+                )?),
+                expected_updated_at: None,
+            },
+            graph_perm::graph_update_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
+        return Ok(node_id);
+    }
+
+    let node_id = GraphNodeId(Uuid::new_v4());
+    graph_db::upsert_node_tx(
+        tx,
+        pool,
+        actor,
+        binding.graph_id,
+        UpsertNodePayload {
+            node_id: Some(node_id),
+            label: task_title.to_string(),
+            metadata: Some(task_node_api_metadata(
+                binding.project_id,
+                binding.link_type,
+                task_id,
+            )?),
+            expected_updated_at: None,
+        },
+        graph_perm::graph_update_access_roles(),
+    )
+    .await
+    .map_err(LibError::from)?;
+
+    if binding.link_type == TaskLinkType::SubtaskOf {
+        let root_node_id = binding.root_node_id.ok_or_else(|| {
+            LibError::database(
+                "Subtask link graph root node is missing",
+                anyhow!(
+                    "project {} subtask graph has no root node",
+                    binding.project_id
+                ),
+            )
+        })?;
+        graph_db::upsert_edge_metadata_tx(
+            tx,
+            pool,
+            actor,
+            binding.graph_id,
+            UpsertEdgeMetadataPayload {
                 from_node_id: root_node_id,
-                to_node_id: GraphNodeId(task_id.0),
-                metadata: json!({"syntheticRootEdge": true}),
-            });
-        }
+                to_node_id: node_id,
+                metadata: synthetic_root_edge_api_metadata()?,
+                expected_updated_at: None,
+            },
+            graph_perm::graph_update_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
     }
 
-    (nodes, edges, root_node_id)
+    sqlx::query(
+        r#"
+        INSERT INTO tasks.task_link_graph_nodes (
+            project_id,
+            link_type,
+            task_id,
+            node_id
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (project_id, link_type, task_id)
+        DO NOTHING
+        "#,
+    )
+    .bind(binding.project_id.0)
+    .bind(binding.link_type.as_db_value())
+    .bind(task_id.0)
+    .bind(node_id.0)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| db_err("Failed to persist task link graph node mapping", err))?;
+
+    let mapped_node_id =
+        node_id_for_task_link_graph_tx(tx, binding.project_id, binding.link_type, task_id)
+            .await?
+            .ok_or_else(|| {
+                LibError::database(
+                    "Task link graph node mapping is missing",
+                    anyhow!(
+                        "mapping missing after insert for task {} in project {} ({})",
+                        task_id,
+                        binding.project_id,
+                        binding.link_type.as_db_value()
+                    ),
+                )
+            })?;
+
+    Ok(mapped_node_id)
 }
 
-fn build_project_graph(
-    kind: GraphKind,
-    task_ids: &[TaskId],
-    edges: &[(TaskId, TaskId)],
-) -> (Vec<GraphNode>, Vec<GraphEdge>) {
-    let mut nodes = Vec::with_capacity(task_ids.len());
-    let mut task_set = HashSet::with_capacity(task_ids.len());
-    for task_id in task_ids {
-        task_set.insert(*task_id);
-        nodes.push(task_node(*task_id));
-    }
+async fn edge_exists_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    graph_id: GraphId,
+    from_node_id: GraphNodeId,
+    to_node_id: GraphNodeId,
+) -> Result<bool> {
+    let row: (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM graph.edges
+            WHERE graph_id = $1
+              AND from_node_id = $2
+              AND to_node_id = $3
+        )
+        "#,
+    )
+    .bind(graph_id.0)
+    .bind(from_node_id.0)
+    .bind(to_node_id.0)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|err| db_err("Failed to query graph edge existence", err))?;
 
-    let mut graph_edges = Vec::with_capacity(edges.len());
-    for (from, to) in edges {
-        if task_set.contains(from) && task_set.contains(to) {
-            graph_edges.push(task_edge(*from, *to));
-        }
-    }
-
-    let _ = kind;
-    (nodes, graph_edges)
+    Ok(row.0)
 }
 
-fn link_type_graph_kind(link_type: TaskLinkType) -> GraphKind {
-    match link_type {
-        TaskLinkType::SubtaskOf => GraphKind::Tree,
-        TaskLinkType::DependsOn => GraphKind::Dag,
-        TaskLinkType::RelatedTo | TaskLinkType::AssignmentOrder => GraphKind::Directed,
-    }
-}
-
-fn merged_reparent_subtask_edges(
-    existing_edges: &[(TaskId, TaskId)],
-    new_parent: TaskId,
-    child: TaskId,
-) -> Vec<(TaskId, TaskId)> {
-    let mut dedupe = HashSet::new();
-    let mut merged = Vec::with_capacity(existing_edges.len() + 1);
-
-    for (from, to) in existing_edges {
-        if *to == child {
-            continue;
-        }
-        if dedupe.insert((*from, *to)) {
-            merged.push((*from, *to));
-        }
-    }
-
-    if dedupe.insert((new_parent, child)) {
-        merged.push((new_parent, child));
-    }
-
-    merged
+async fn edge_metadata_row_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    graph_id: GraphId,
+    from_node_id: GraphNodeId,
+    to_node_id: GraphNodeId,
+) -> Result<Option<GraphEdgeMetadataRow>> {
+    sqlx::query_as::<_, GraphEdgeMetadataRow>(
+        r#"
+        SELECT created_at
+        FROM graph.edges
+        WHERE graph_id = $1
+          AND from_node_id = $2
+          AND to_node_id = $3
+        LIMIT 1
+        "#,
+    )
+    .bind(graph_id.0)
+    .bind(from_node_id.0)
+    .bind(to_node_id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|err| db_err("Failed to query graph edge metadata", err))
 }
 
 fn normalize_free_text(value: Option<String>) -> Option<String> {
@@ -351,69 +799,6 @@ where
     Ok(rows.into_iter().map(|row| ProjectId(row.0)).collect())
 }
 
-async fn project_task_ids<'e, E>(executor: E, project_id: ProjectId) -> Result<Vec<TaskId>>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let rows = sqlx::query_as::<_, (Uuid,)>(
-        r#"
-        SELECT tp.task_id
-        FROM tasks.task_projects tp
-        JOIN tasks.tasks t
-          ON t.id = tp.task_id
-        WHERE tp.project_id = $1
-          AND t.deleted_at IS NULL
-        ORDER BY tp.task_id ASC
-        "#,
-    )
-    .bind(project_id.0)
-    .fetch_all(executor)
-    .await
-    .map_err(|err| db_err("Failed to query project tasks", err))?;
-
-    Ok(rows.into_iter().map(|row| TaskId(row.0)).collect())
-}
-
-async fn project_link_edges<'e, E>(
-    executor: E,
-    project_id: ProjectId,
-    link_type: TaskLinkType,
-) -> Result<Vec<(TaskId, TaskId)>>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let rows = sqlx::query_as::<_, (Uuid, Uuid)>(
-        r#"
-        SELECT tl.task_from_id, tl.task_to_id
-        FROM tasks.task_links tl
-        JOIN tasks.task_projects p_from
-          ON p_from.task_id = tl.task_from_id
-         AND p_from.project_id = $1
-        JOIN tasks.task_projects p_to
-          ON p_to.task_id = tl.task_to_id
-         AND p_to.project_id = $1
-        JOIN tasks.tasks t_from
-          ON t_from.id = tl.task_from_id
-         AND t_from.deleted_at IS NULL
-        JOIN tasks.tasks t_to
-          ON t_to.id = tl.task_to_id
-         AND t_to.deleted_at IS NULL
-        WHERE tl.link_type = $2
-        ORDER BY tl.task_from_id ASC, tl.task_to_id ASC
-        "#,
-    )
-    .bind(project_id.0)
-    .bind(link_type.as_db_value())
-    .fetch_all(executor)
-    .await
-    .map_err(|err| db_err("Failed to query project task links", err))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(from_id, to_id)| (TaskId(from_id), TaskId(to_id)))
-        .collect())
-}
-
 async fn lock_tasks_for_projects<'e, E>(executor: E, project_ids: &[ProjectId]) -> Result<()>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -443,94 +828,290 @@ where
 }
 
 async fn subtree_task_ids_for_root(pool: &PgPool, task_id: TaskId) -> Result<Vec<TaskId>> {
-    let rows = sqlx::query_as::<_, (Uuid,)>(
+    let mut task_ids = HashSet::from([task_id]);
+    let project_rows = sqlx::query_as::<_, (Uuid,)>(
         r#"
-        WITH RECURSIVE subtree AS (
-            SELECT $1::uuid AS task_id
-            UNION
-            SELECT tl.task_to_id
-            FROM tasks.task_links tl
-            JOIN subtree s
-              ON s.task_id = tl.task_from_id
-            JOIN tasks.tasks t
-              ON t.id = tl.task_to_id
-            WHERE tl.link_type = 'subtask_of'
-              AND t.deleted_at IS NULL
-        )
-        SELECT task_id
-        FROM subtree
-        ORDER BY task_id ASC
-        LIMIT $2
+        SELECT tp.project_id
+        FROM tasks.task_projects tp
+        JOIN tasks.projects p
+          ON p.id = tp.project_id
+        WHERE tp.task_id = $1
+          AND p.deleted_at IS NULL
+        ORDER BY tp.project_id ASC
         "#,
     )
     .bind(task_id.0)
-    .bind(SUBTREE_MAX_TASKS as i64)
     .fetch_all(pool)
     .await
-    .map_err(|err| db_err("Failed to query task subtree", err))?;
+    .map_err(|err| db_err("Failed to query task projects for subtree traversal", err))?;
 
-    Ok(rows.into_iter().map(|row| TaskId(row.0)).collect())
+    for (project_uuid,) in project_rows {
+        let project_id = ProjectId(project_uuid);
+        let bindings = load_project_link_graph_bindings(pool, project_id).await?;
+        let Some(subtask_binding) = bindings.get(&TaskLinkType::SubtaskOf).copied() else {
+            continue;
+        };
+
+        let node_row = sqlx::query_as::<_, TaskLinkGraphNodeRow>(
+            r#"
+            SELECT node_id
+            FROM tasks.task_link_graph_nodes
+            WHERE project_id = $1
+              AND link_type = 'subtask_of'
+              AND task_id = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(project_id.0)
+        .bind(task_id.0)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| db_err("Failed to query subtree root graph node mapping", err))?;
+
+        let Some(node_row) = node_row else {
+            continue;
+        };
+
+        let rows = sqlx::query_as::<_, (Uuid,)>(
+            r#"
+            WITH RECURSIVE subtree(node_id) AS (
+                SELECT $2::uuid
+                UNION
+                SELECT e.to_node_id
+                FROM graph.edges e
+                JOIN subtree s
+                  ON s.node_id = e.from_node_id
+                JOIN graph.nodes n_to
+                  ON n_to.graph_id = e.graph_id
+                 AND n_to.id = e.to_node_id
+                WHERE e.graph_id = $1
+                  AND n_to.metadata ->> 'external_id' IS NOT NULL
+            )
+            SELECT DISTINCT (n.metadata ->> 'external_id')::uuid AS task_id
+            FROM subtree s
+            JOIN graph.nodes n
+              ON n.graph_id = $1
+             AND n.id = s.node_id
+            JOIN tasks.tasks t
+              ON t.id = (n.metadata ->> 'external_id')::uuid
+            WHERE n.metadata ->> 'external_id' IS NOT NULL
+              AND t.deleted_at IS NULL
+            ORDER BY task_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(subtask_binding.graph_id.0)
+        .bind(node_row.node_id)
+        .bind(SUBTREE_MAX_TASKS as i64)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| db_err("Failed to traverse subtask graph subtree", err))?;
+
+        for (subtree_task_id,) in rows {
+            task_ids.insert(TaskId(subtree_task_id));
+            if task_ids.len() >= SUBTREE_MAX_TASKS {
+                break;
+            }
+        }
+        if task_ids.len() >= SUBTREE_MAX_TASKS {
+            break;
+        }
+    }
+
+    let mut output = task_ids.into_iter().collect::<Vec<_>>();
+    output.sort_by_key(|id| id.0);
+    Ok(output)
 }
 
-async fn validate_project_link_graph_integrity<'e, E>(
-    executor: E,
+async fn validate_project_link_graph_integrity(
+    pool: &PgPool,
+    actor: UserId,
     project_id: ProjectId,
-) -> Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres> + Copy,
-{
-    let task_ids = project_task_ids(executor, project_id).await?;
-    let subtask_edges = project_link_edges(executor, project_id, TaskLinkType::SubtaskOf).await?;
-    let depends_edges = project_link_edges(executor, project_id, TaskLinkType::DependsOn).await?;
-    let related_edges = project_link_edges(executor, project_id, TaskLinkType::RelatedTo).await?;
-    let assignment_edges =
-        project_link_edges(executor, project_id, TaskLinkType::AssignmentOrder).await?;
+) -> Result<()> {
+    let bindings = load_project_link_graph_bindings(pool, project_id).await?;
+    for link_type in TASK_LINK_TYPES {
+        let Some(binding) = bindings.get(&link_type).copied() else {
+            continue;
+        };
+        let graph = get_graph(
+            pool,
+            actor,
+            binding.graph_id,
+            graph_perm::graph_read_access_roles(),
+        )
+        .await
+        .map_err(LibError::from)?;
 
-    let (subtask_nodes, subtask_graph_edges, _) =
-        build_project_subtask_tree_graph(project_id, &task_ids, &subtask_edges);
-    let subtask_violations =
-        graph_invariant_violations(GraphKind::Tree, &subtask_nodes, &subtask_graph_edges);
-    if !subtask_violations.is_empty() {
-        return Err(LibError::invalid(
-            "Subtask tree contains invalid structure",
-            anyhow!(
-                "subtask tree integrity failed for project {project_id}: {}",
-                graph_violation_values(&subtask_violations)
-            ),
-        ));
-    }
-
-    let (depends_nodes, depends_graph_edges) =
-        build_project_graph(GraphKind::Dag, &task_ids, &depends_edges);
-    let depends_violations =
-        graph_invariant_violations(GraphKind::Dag, &depends_nodes, &depends_graph_edges);
-    if !depends_violations.is_empty() {
-        return Err(LibError::invalid(
-            "Dependency graph contains invalid structure",
-            anyhow!(
-                "dependency graph integrity failed for project {project_id}: {}",
-                graph_violation_values(&depends_violations)
-            ),
-        ));
-    }
-
-    let mut related_all_edges = related_edges;
-    related_all_edges.extend(assignment_edges);
-    let (related_nodes, related_graph_edges) =
-        build_project_graph(GraphKind::Directed, &task_ids, &related_all_edges);
-    let related_violations =
-        graph_invariant_violations(GraphKind::Directed, &related_nodes, &related_graph_edges);
-    if !related_violations.is_empty() {
-        return Err(LibError::invalid(
-            "Related-task graph contains invalid structure",
-            anyhow!(
-                "related graph integrity failed for project {project_id}: {}",
-                graph_violation_values(&related_violations)
-            ),
-        ));
+        let target_kind = match link_type {
+            TaskLinkType::SubtaskOf => GraphKind::Tree,
+            TaskLinkType::DependsOn => GraphKind::Dag,
+            TaskLinkType::RelatedTo | TaskLinkType::AssignmentOrder => GraphKind::Directed,
+        };
+        let violations = graph_invariant_violations(target_kind, &graph.nodes, &graph.edges);
+        if !violations.is_empty() {
+            return Err(LibError::invalid(
+                "Project link graph contains invalid structure",
+                anyhow!(
+                    "project {project_id} link_type {} failed validation: {}",
+                    link_type.as_db_value(),
+                    graph_violation_values(&violations)
+                ),
+            ));
+        }
     }
 
     Ok(())
+}
+
+async fn load_task_links_from_graph(
+    pool: &PgPool,
+    actor: UserId,
+    task_id: TaskId,
+    project_ids: &[ProjectId],
+) -> Result<(Vec<TaskLink>, Vec<TaskLink>)> {
+    if project_ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut checked_graph_ids = HashSet::new();
+    let mut deduped = HashMap::<(Uuid, Uuid, String), TaskLink>::new();
+
+    for project_id in project_ids {
+        let bindings = load_project_link_graph_bindings(pool, *project_id).await?;
+        for link_type in TASK_LINK_TYPES {
+            let Some(binding) = bindings.get(&link_type).copied() else {
+                continue;
+            };
+            if checked_graph_ids.insert(binding.graph_id.0) {
+                ensure_graph_read_access(pool, actor, binding.graph_id).await?;
+            }
+
+            let node_row = sqlx::query_as::<_, TaskLinkGraphNodeRow>(
+                r#"
+                SELECT node_id
+                FROM tasks.task_link_graph_nodes
+                WHERE project_id = $1
+                  AND link_type = $2
+                  AND task_id = $3
+                LIMIT 1
+                "#,
+            )
+            .bind(project_id.0)
+            .bind(link_type.as_db_value())
+            .bind(task_id.0)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| db_err("Failed to query task link graph node mapping", err))?;
+
+            let Some(node_row) = node_row else {
+                continue;
+            };
+
+            let rows = sqlx::query_as::<_, GraphIncidentLinkRow>(
+                r#"
+                SELECT
+                    e.metadata,
+                    e.created_at,
+                    n_from.metadata AS from_metadata,
+                    n_to.metadata AS to_metadata,
+                    t_from.title AS from_title,
+                    t_to.title AS to_title
+                FROM graph.edges e
+                JOIN graph.nodes n_from
+                  ON n_from.graph_id = e.graph_id
+                 AND n_from.id = e.from_node_id
+                JOIN graph.nodes n_to
+                  ON n_to.graph_id = e.graph_id
+                 AND n_to.id = e.to_node_id
+                LEFT JOIN tasks.tasks t_from
+                  ON t_from.id = (n_from.metadata ->> 'external_id')::uuid
+                 AND t_from.deleted_at IS NULL
+                LEFT JOIN tasks.tasks t_to
+                  ON t_to.id = (n_to.metadata ->> 'external_id')::uuid
+                 AND t_to.deleted_at IS NULL
+                WHERE e.graph_id = $1
+                  AND (e.from_node_id = $2 OR e.to_node_id = $2)
+                ORDER BY e.created_at DESC, e.from_node_id ASC, e.to_node_id ASC
+                "#,
+            )
+            .bind(binding.graph_id.0)
+            .bind(node_row.node_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|err| db_err("Failed to query graph incident links", err))?;
+
+            for row in rows {
+                let from_task_id = match parse_task_id_from_node_metadata(&row.from_metadata)? {
+                    Some(task) => task,
+                    None => continue,
+                };
+                let to_task_id = match parse_task_id_from_node_metadata(&row.to_metadata)? {
+                    Some(task) => task,
+                    None => continue,
+                };
+                if from_task_id != task_id && to_task_id != task_id {
+                    continue;
+                }
+
+                let subtask_parent_state = if link_type == TaskLinkType::SubtaskOf {
+                    parse_subtask_parent_state_from_edge_metadata(&row.metadata)?
+                } else {
+                    None
+                };
+                let other_task_title = if from_task_id == task_id {
+                    row.to_title
+                } else {
+                    row.from_title
+                };
+
+                let link = TaskLink {
+                    task_from_id: from_task_id,
+                    task_to_id: to_task_id,
+                    link_type,
+                    subtask_parent_state,
+                    other_task_title,
+                    created_at: row.created_at,
+                };
+
+                let key = (
+                    link.task_from_id.0,
+                    link.task_to_id.0,
+                    link.link_type.as_db_value().to_string(),
+                );
+                match deduped.get_mut(&key) {
+                    Some(existing) if existing.created_at >= link.created_at => {}
+                    Some(existing) => *existing = link,
+                    None => {
+                        deduped.insert(key, link);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut links_out = deduped
+        .values()
+        .filter(|link| link.task_from_id == task_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut links_in = deduped
+        .values()
+        .filter(|link| link.task_to_id == task_id)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    links_out.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.task_to_id.0.cmp(&b.task_to_id.0))
+    });
+    links_in.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.task_from_id.0.cmp(&b.task_from_id.0))
+    });
+
+    Ok((links_out, links_in))
 }
 
 pub async fn create_task_with_roles(
@@ -552,6 +1133,8 @@ pub async fn create_task_with_roles(
 
     let title = normalize_task_title(&payload.title)?;
     let description = normalize_description(payload.description);
+    let project_link_bindings =
+        project_link_graph_bindings_for_actor(pool, actor, payload.project_id).await?;
 
     if let Some(milestone_id) = payload.milestone_id {
         validate_milestone_access_for_task(pool, actor, milestone_id).await?;
@@ -638,8 +1221,8 @@ pub async fn create_task_with_roles(
     )
     .bind(task_id.0)
     .bind(slug)
-    .bind(title)
-    .bind(description)
+    .bind(&title)
+    .bind(&description)
     .bind(actor.0)
     .bind(payload.assignee_user_id.map(|id| id.0))
     .bind(payload.priority.unwrap_or(0))
@@ -663,6 +1246,13 @@ pub async fn create_task_with_roles(
     .execute(&mut *tx)
     .await
     .map_err(|err| db_err("Failed to attach task to project", err))?;
+
+    for link_type in TASK_LINK_TYPES {
+        let Some(binding) = project_link_bindings.get(&link_type).copied() else {
+            continue;
+        };
+        ensure_task_node_in_link_graph_tx(&mut tx, pool, actor, binding, task_id, &title).await?;
+    }
 
     for (graph_id, current_node_id, order) in graph_assignments {
         sqlx::query(
@@ -719,7 +1309,7 @@ pub async fn get_task_with_roles(
 ) -> Result<TaskDetails> {
     let _ = load_accessible_task(pool, actor, task_id, perm::task_read()).await?;
     let row = load_task_presentation_row(pool, task_id).await?;
-    let details = match row {
+    let mut details = match row {
         Some(row) => to_task_details_from_presentation_row(row)?,
         None => {
             return Err(LibError::database(
@@ -730,6 +1320,10 @@ pub async fn get_task_with_roles(
     };
 
     ensure_task_assignment_graph_access(pool, actor, &details.graph_assignments).await?;
+    let (links_out, links_in) =
+        load_task_links_from_graph(pool, actor, task_id, &details.project_ids).await?;
+    details.links_out = links_out;
+    details.links_in = links_in;
     Ok(details)
 }
 
@@ -910,7 +1504,8 @@ pub async fn update_task_with_roles(
                 })?;
 
                 for (project_id,) in rows {
-                    validate_project_link_graph_integrity(pool, ProjectId(project_id)).await?;
+                    validate_project_link_graph_integrity(pool, actor, ProjectId(project_id))
+                        .await?;
                 }
             }
         }
@@ -1088,22 +1683,76 @@ pub async fn delete_task_with_roles(pool: &PgPool, actor: UserId, task_id: TaskI
     .await
     .map_err(|err| db_err("Failed to cascade delete tasks", err))?;
 
-    sqlx::query(
+    let project_rows = sqlx::query_as::<_, (Uuid,)>(
         r#"
-        DELETE FROM tasks.task_links
-        WHERE task_from_id = ANY($1)
-           OR task_to_id = ANY($1)
+        SELECT DISTINCT tp.project_id
+        FROM tasks.task_projects tp
+        WHERE tp.task_id = ANY($1)
+        ORDER BY tp.project_id ASC
         "#,
     )
-    .bind(
-        subtree_task_ids
-            .iter()
-            .map(|id| id.0)
-            .collect::<Vec<Uuid>>(),
-    )
-    .execute(pool)
+    .bind(subtree_task_ids.iter().map(|id| id.0).collect::<Vec<_>>())
+    .fetch_all(pool)
     .await
-    .map_err(|err| db_err("Failed to excise deleted task links", err))?;
+    .map_err(|err| db_err("Failed to query project scopes for graph cleanup", err))?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|err| db_err("Failed to start graph cleanup transaction", err))?;
+    for (project_uuid,) in project_rows {
+        let project_id = ProjectId(project_uuid);
+        let bindings = load_project_link_graph_bindings(&mut *tx, project_id).await?;
+        for affected_task_id in &subtree_task_ids {
+            for link_type in TASK_LINK_TYPES {
+                let Some(binding) = bindings.get(&link_type).copied() else {
+                    continue;
+                };
+                let Some(node_id) = node_id_for_task_link_graph_tx(
+                    &mut tx,
+                    project_id,
+                    link_type,
+                    *affected_task_id,
+                )
+                .await?
+                else {
+                    continue;
+                };
+
+                graph_db::remove_node_tx(
+                    &mut tx,
+                    pool,
+                    actor,
+                    binding.graph_id,
+                    subseq_graph::models::RemoveNodePayload {
+                        node_id,
+                        expected_updated_at: None,
+                    },
+                    graph_perm::graph_update_access_roles(),
+                )
+                .await
+                .map_err(LibError::from)?;
+
+                sqlx::query(
+                    r#"
+                    DELETE FROM tasks.task_link_graph_nodes
+                    WHERE project_id = $1
+                      AND link_type = $2
+                      AND task_id = $3
+                    "#,
+                )
+                .bind(project_id.0)
+                .bind(link_type.as_db_value())
+                .bind(affected_task_id.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| db_err("Failed to delete task link graph node mapping", err))?;
+            }
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|err| db_err("Failed to commit graph cleanup transaction", err))?;
 
     for (affected_task_uuid, state_value) in state_rows {
         let affected_task_id = TaskId(affected_task_uuid);
@@ -1129,6 +1778,31 @@ pub async fn delete_task_with_roles(pool: &PgPool, actor: UserId, task_id: TaskI
     }
 
     Ok(())
+}
+
+async fn load_task_titles_for_ids_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task_ids: &[TaskId],
+) -> Result<HashMap<TaskId, String>> {
+    let ids = task_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+    let rows = sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT id, title
+        FROM tasks.tasks
+        WHERE id = ANY($1)
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|err| db_err("Failed to query task titles for graph nodes", err))?;
+
+    let mut titles = HashMap::with_capacity(rows.len());
+    for (id, title) in rows {
+        titles.insert(TaskId(id), title);
+    }
+    Ok(titles)
 }
 
 pub async fn create_task_link_with_roles(
@@ -1162,124 +1836,112 @@ pub async fn create_task_link_with_roles(
     let subtask_parent_state =
         normalize_subtask_parent_state_for_link(payload.link_type, payload.subtask_parent_state)?;
 
+    let mut project_bindings = HashMap::with_capacity(shared_projects.len());
+    for project_id in &shared_projects {
+        project_bindings.insert(
+            *project_id,
+            project_link_graph_bindings_for_actor(pool, actor, *project_id).await?,
+        );
+    }
+
     let mut tx = pool
         .begin()
         .await
         .map_err(|err| db_err("Failed to start transaction", err))?;
 
     lock_tasks_for_projects(&mut *tx, &shared_projects).await?;
+    let task_titles =
+        load_task_titles_for_ids_tx(&mut tx, &[task_id, payload.other_task_id]).await?;
+    let task_title = task_titles.get(&task_id).ok_or_else(|| {
+        LibError::not_found(
+            "Task not found",
+            anyhow!("task {} disappeared before link creation", task_id),
+        )
+    })?;
+    let other_task_title = task_titles.get(&payload.other_task_id).ok_or_else(|| {
+        LibError::not_found(
+            "Task not found",
+            anyhow!(
+                "task {} disappeared before link creation",
+                payload.other_task_id
+            ),
+        )
+    })?;
 
+    let mut created_at = None;
     for project_id in &shared_projects {
-        let project_tasks = project_task_ids(&mut *tx, *project_id).await?;
-        let task_set: HashSet<TaskId> = project_tasks.iter().copied().collect();
-        if !task_set.contains(&task_id) || !task_set.contains(&payload.other_task_id) {
-            continue;
+        let bindings = project_bindings.get(project_id).ok_or_else(|| {
+            LibError::database(
+                "Project link graph bindings are missing",
+                anyhow!("missing link graph map for project {}", project_id),
+            )
+        })?;
+        let binding = bindings.get(&payload.link_type).copied().ok_or_else(|| {
+            LibError::database(
+                "Project link graph binding is missing",
+                anyhow!(
+                    "missing link graph binding for project {} link_type {}",
+                    project_id,
+                    payload.link_type.as_db_value()
+                ),
+            )
+        })?;
+
+        let from_node_id =
+            ensure_task_node_in_link_graph_tx(&mut tx, pool, actor, binding, task_id, task_title)
+                .await?;
+        let to_node_id = ensure_task_node_in_link_graph_tx(
+            &mut tx,
+            pool,
+            actor,
+            binding,
+            payload.other_task_id,
+            other_task_title,
+        )
+        .await?;
+
+        if payload.link_type == TaskLinkType::SubtaskOf {
+            graph_db::reparent_node_tx(
+                &mut tx,
+                pool,
+                actor,
+                binding.graph_id,
+                ReparentNodePayload {
+                    node_id: to_node_id,
+                    new_parent_node_id: Some(from_node_id),
+                    metadata: subtask_parent_state
+                        .map(subtask_parent_edge_api_metadata)
+                        .transpose()?,
+                    expected_updated_at: None,
+                },
+                graph_perm::graph_update_access_roles(),
+            )
+            .await
+            .map_err(LibError::from)?;
+        } else {
+            graph_db::upsert_edge_metadata_tx(
+                &mut tx,
+                pool,
+                actor,
+                binding.graph_id,
+                UpsertEdgeMetadataPayload {
+                    from_node_id,
+                    to_node_id,
+                    metadata: default_edge_api_metadata()?,
+                    expected_updated_at: None,
+                },
+                graph_perm::graph_update_access_roles(),
+            )
+            .await
+            .map_err(LibError::from)?;
         }
 
-        match payload.link_type {
-            TaskLinkType::SubtaskOf => {
-                let existing_edges =
-                    project_link_edges(&mut *tx, *project_id, TaskLinkType::SubtaskOf).await?;
-                let candidate_edges =
-                    merged_reparent_subtask_edges(&existing_edges, task_id, payload.other_task_id);
-                let (nodes, edges, _) =
-                    build_project_subtask_tree_graph(*project_id, &project_tasks, &candidate_edges);
-                let violations = graph_invariant_violations(GraphKind::Tree, &nodes, &edges);
-                if !violations.is_empty() {
-                    return Err(LibError::invalid(
-                        "Subtask link would violate tree constraints",
-                        anyhow!(
-                            "project {project_id} subtask add failed with violations: {}",
-                            graph_violation_values(&violations)
-                        ),
-                    ));
-                }
-            }
-            _ => {
-                let existing_edges =
-                    project_link_edges(&mut *tx, *project_id, payload.link_type).await?;
-                let graph_kind = link_type_graph_kind(payload.link_type);
-                let (nodes, edges) =
-                    build_project_graph(graph_kind, &project_tasks, &existing_edges);
-                let index = GraphMutationIndex::new(graph_kind, &nodes, &edges);
-                let violations = index.would_add_edge_violations(
-                    GraphNodeId(task_id.0),
-                    GraphNodeId(payload.other_task_id.0),
-                );
-                if !violations.is_empty() {
-                    return Err(LibError::invalid(
-                        "Task link would violate graph constraints",
-                        anyhow!(
-                            "project {project_id} {:?} add failed with violations: {}",
-                            payload.link_type,
-                            graph_violation_values(&violations)
-                        ),
-                    ));
-                }
-            }
+        if created_at.is_none() {
+            created_at = edge_metadata_row_tx(&mut tx, binding.graph_id, from_node_id, to_node_id)
+                .await?
+                .map(|row| row.created_at);
         }
     }
-
-    if payload.link_type == TaskLinkType::SubtaskOf {
-        sqlx::query(
-            r#"
-            DELETE FROM tasks.task_links
-            WHERE link_type = 'subtask_of'
-              AND task_to_id = $1
-              AND task_from_id <> $2
-            "#,
-        )
-        .bind(payload.other_task_id.0)
-        .bind(task_id.0)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| db_err("Failed to reparent existing subtask edges", err))?;
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO tasks.task_links (
-            task_from_id,
-            task_to_id,
-            link_type,
-            subtask_parent_state
-        )
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (task_from_id, task_to_id, link_type)
-        DO UPDATE SET
-            subtask_parent_state = EXCLUDED.subtask_parent_state,
-            created_at = CURRENT_TIMESTAMP
-        "#,
-    )
-    .bind(task_id.0)
-    .bind(payload.other_task_id.0)
-    .bind(payload.link_type.as_db_value())
-    .bind(subtask_parent_state.map(|state| state.as_str().to_string()))
-    .execute(&mut *tx)
-    .await
-    .map_err(|err| db_err("Failed to create task link", err))?;
-
-    let row = sqlx::query_as::<_, TaskLinkRow>(
-        r#"
-        SELECT
-            task_from_id,
-            task_to_id,
-            link_type,
-            subtask_parent_state,
-            created_at
-        FROM tasks.task_links
-        WHERE task_from_id = $1
-          AND task_to_id = $2
-          AND link_type = $3
-        LIMIT 1
-        "#,
-    )
-    .bind(task_id.0)
-    .bind(payload.other_task_id.0)
-    .bind(payload.link_type.as_db_value())
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|err| db_err("Failed to fetch task link", err))?;
 
     tx.commit()
         .await
@@ -1301,7 +1963,14 @@ pub async fn create_task_link_with_roles(
     )
     .await?;
 
-    to_task_link(row)
+    Ok(TaskLink {
+        task_from_id: task_id,
+        task_to_id: payload.other_task_id,
+        link_type: payload.link_type,
+        subtask_parent_state,
+        other_task_title: None,
+        created_at: created_at.unwrap_or_else(|| Utc::now().naive_utc()),
+    })
 }
 
 pub async fn delete_task_links_with_roles(
@@ -1314,6 +1983,14 @@ pub async fn delete_task_links_with_roles(
     load_accessible_task(pool, actor, other_task_id, perm::task_link()).await?;
 
     let shared_projects = shared_project_ids_for_tasks(pool, task_id, other_task_id).await?;
+    let mut project_bindings = HashMap::with_capacity(shared_projects.len());
+    for project_id in &shared_projects {
+        project_bindings.insert(
+            *project_id,
+            project_link_graph_bindings_for_actor(pool, actor, *project_id).await?,
+        );
+    }
+
     let mut tx = pool
         .begin()
         .await
@@ -1324,61 +2001,148 @@ pub async fn delete_task_links_with_roles(
     }
 
     let mut isolated_subtree = false;
+    let mut rows_affected: i64 = 0;
     for project_id in &shared_projects {
-        let project_tasks = project_task_ids(&mut *tx, *project_id).await?;
-        let subtask_edges =
-            project_link_edges(&mut *tx, *project_id, TaskLinkType::SubtaskOf).await?;
-        if subtask_edges.is_empty() {
-            continue;
+        let bindings = project_bindings.get(project_id).ok_or_else(|| {
+            LibError::database(
+                "Project link graph bindings are missing",
+                anyhow!("missing link graph map for project {}", project_id),
+            )
+        })?;
+
+        if let Some(subtask_binding) = bindings.get(&TaskLinkType::SubtaskOf).copied() {
+            let root_node_id = subtask_binding.root_node_id.ok_or_else(|| {
+                LibError::database(
+                    "Subtask graph root node is missing",
+                    anyhow!("project {} subtask graph has no root node", project_id),
+                )
+            })?;
+            let task_node_id = node_id_for_task_link_graph_tx(
+                &mut tx,
+                *project_id,
+                TaskLinkType::SubtaskOf,
+                task_id,
+            )
+            .await?;
+            let other_node_id = node_id_for_task_link_graph_tx(
+                &mut tx,
+                *project_id,
+                TaskLinkType::SubtaskOf,
+                other_task_id,
+            )
+            .await?;
+
+            if let (Some(task_node_id), Some(other_node_id)) = (task_node_id, other_node_id) {
+                if edge_exists_tx(
+                    &mut tx,
+                    subtask_binding.graph_id,
+                    task_node_id,
+                    other_node_id,
+                )
+                .await?
+                {
+                    isolated_subtree = true;
+                    rows_affected += 1;
+                    graph_db::reparent_node_tx(
+                        &mut tx,
+                        pool,
+                        actor,
+                        subtask_binding.graph_id,
+                        ReparentNodePayload {
+                            node_id: other_node_id,
+                            new_parent_node_id: Some(root_node_id),
+                            metadata: Some(synthetic_root_edge_api_metadata()?),
+                            expected_updated_at: None,
+                        },
+                        graph_perm::graph_update_access_roles(),
+                    )
+                    .await
+                    .map_err(LibError::from)?;
+                }
+
+                if edge_exists_tx(
+                    &mut tx,
+                    subtask_binding.graph_id,
+                    other_node_id,
+                    task_node_id,
+                )
+                .await?
+                {
+                    isolated_subtree = true;
+                    rows_affected += 1;
+                    graph_db::reparent_node_tx(
+                        &mut tx,
+                        pool,
+                        actor,
+                        subtask_binding.graph_id,
+                        ReparentNodePayload {
+                            node_id: task_node_id,
+                            new_parent_node_id: Some(root_node_id),
+                            metadata: Some(synthetic_root_edge_api_metadata()?),
+                            expected_updated_at: None,
+                        },
+                        graph_perm::graph_update_access_roles(),
+                    )
+                    .await
+                    .map_err(LibError::from)?;
+                }
+            }
         }
 
-        let (nodes, edges, _) =
-            build_project_subtask_tree_graph(*project_id, &project_tasks, &subtask_edges);
-        let index = GraphMutationIndex::new(GraphKind::Tree, &nodes, &edges);
-        if index.would_remove_edge_isolate_subgraph(
-            GraphNodeId(task_id.0),
-            GraphNodeId(other_task_id.0),
-        ) || index.would_remove_edge_isolate_subgraph(
-            GraphNodeId(other_task_id.0),
-            GraphNodeId(task_id.0),
-        ) {
-            isolated_subtree = true;
-        }
+        for link_type in [
+            TaskLinkType::DependsOn,
+            TaskLinkType::RelatedTo,
+            TaskLinkType::AssignmentOrder,
+        ] {
+            let Some(binding) = bindings.get(&link_type).copied() else {
+                continue;
+            };
+            let task_node_id =
+                node_id_for_task_link_graph_tx(&mut tx, *project_id, link_type, task_id).await?;
+            let other_node_id =
+                node_id_for_task_link_graph_tx(&mut tx, *project_id, link_type, other_task_id)
+                    .await?;
+            let (Some(task_node_id), Some(other_node_id)) = (task_node_id, other_node_id) else {
+                continue;
+            };
 
-        let candidate_edges: Vec<(TaskId, TaskId)> = subtask_edges
-            .into_iter()
-            .filter(|(from, to)| {
-                !((*from == task_id && *to == other_task_id)
-                    || (*from == other_task_id && *to == task_id))
-            })
-            .collect();
-        let (candidate_nodes, candidate_graph_edges, _) =
-            build_project_subtask_tree_graph(*project_id, &project_tasks, &candidate_edges);
-        let violations =
-            graph_invariant_violations(GraphKind::Tree, &candidate_nodes, &candidate_graph_edges);
-        if !violations.is_empty() {
-            return Err(LibError::invalid(
-                "Removing this link would violate subtree constraints",
-                anyhow!(
-                    "project {project_id} remove edge validation failed: {}",
-                    graph_violation_values(&violations)
-                ),
-            ));
+            if edge_exists_tx(&mut tx, binding.graph_id, task_node_id, other_node_id).await? {
+                rows_affected += 1;
+                graph_db::remove_edge_tx(
+                    &mut tx,
+                    pool,
+                    actor,
+                    binding.graph_id,
+                    RemoveEdgePayload {
+                        from_node_id: task_node_id,
+                        to_node_id: other_node_id,
+                        expected_updated_at: None,
+                    },
+                    graph_perm::graph_update_access_roles(),
+                )
+                .await
+                .map_err(LibError::from)?;
+            }
+
+            if edge_exists_tx(&mut tx, binding.graph_id, other_node_id, task_node_id).await? {
+                rows_affected += 1;
+                graph_db::remove_edge_tx(
+                    &mut tx,
+                    pool,
+                    actor,
+                    binding.graph_id,
+                    RemoveEdgePayload {
+                        from_node_id: other_node_id,
+                        to_node_id: task_node_id,
+                        expected_updated_at: None,
+                    },
+                    graph_perm::graph_update_access_roles(),
+                )
+                .await
+                .map_err(LibError::from)?;
+            }
         }
     }
-
-    let result = sqlx::query(
-        r#"
-        DELETE FROM tasks.task_links
-        WHERE (task_from_id = $1 AND task_to_id = $2)
-           OR (task_from_id = $2 AND task_to_id = $1)
-        "#,
-    )
-    .bind(task_id.0)
-    .bind(other_task_id.0)
-    .execute(&mut *tx)
-    .await
-    .map_err(|err| db_err("Failed to delete task links", err))?;
 
     tx.commit()
         .await
@@ -1393,7 +2157,7 @@ pub async fn delete_task_links_with_roles(
         None,
         json!({
             "otherTaskId": other_task_id.0,
-            "rowsAffected": result.rows_affected(),
+            "rowsAffected": rows_affected,
             "isolatedSubtree": isolated_subtree,
             "sharedProjectCount": shared_projects.len() as i64,
         }),
@@ -1869,6 +2633,13 @@ mod tests {
             graph_perm::graph_read_role(),
         )
         .await?;
+        grant_user_graph_role(
+            pool,
+            actors.owner,
+            actors.group_id,
+            graph_perm::graph_update_role(),
+        )
+        .await?;
 
         clear_group_roles(pool, actors.group_id).await?;
         for role in [
@@ -2087,6 +2858,7 @@ mod tests {
             let project_scope_id = fixture.project.id.0.to_string();
 
             grant_user_graph_role(&pool, member, group_id, graph_perm::graph_read_role()).await?;
+            grant_user_graph_role(&pool, member, group_id, graph_perm::graph_update_role()).await?;
 
             clear_group_roles(&pool, group_id).await?;
             for role in [
