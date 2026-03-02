@@ -5,8 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use subseq_auth::prelude::ValidatesIdentity;
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::{UserId, ValidatesIdentity};
 
 use crate::error::{ErrorKind, LibError};
 use crate::models::{MilestoneId, MilestoneUpdate, ProjectId, ProjectUpdate, TaskId, TaskUpdate};

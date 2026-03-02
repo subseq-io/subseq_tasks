@@ -3,7 +3,7 @@ use std::str::FromStr;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::UserId;
 use subseq_graph::models::{GraphId, GraphNodeId};
 
 use super::{

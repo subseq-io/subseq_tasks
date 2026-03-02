@@ -1,8 +1,7 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use subseq_auth::group_id::GroupId;
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::{GroupId, UserId};
 use subseq_graph::models::GraphId;
 
 use super::ProjectId;

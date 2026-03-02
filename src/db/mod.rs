@@ -8,8 +8,7 @@ use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use subseq_auth::group_id::GroupId;
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::{GroupId, UserId};
 use subseq_graph::db::get_graph;
 use subseq_graph::models::GraphId;
 use subseq_graph::permissions as graph_perm;

@@ -11,8 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use subseq_auth::prelude::AuthenticatedUser;
-use subseq_auth::user_id::UserId;
+use subseq_auth::prelude::{AuthenticatedUser, UserId};
 
 use crate::db;
 use crate::models::{

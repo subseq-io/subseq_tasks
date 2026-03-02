@@ -46,7 +46,6 @@ pub mod prelude {
         scope_project, scope_task, scope_tasks, task_create, task_delete, task_link, task_read,
         task_read_access_roles, task_transition, task_update, write_permissions,
     };
-    pub use subseq_auth::group_id::GroupId;
-    pub use subseq_auth::user_id::UserId;
+    pub use subseq_auth::prelude::{GroupId, UserId};
     pub use subseq_graph::models::{GraphId, GraphNodeId};
 }
