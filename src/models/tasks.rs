@@ -8,7 +8,7 @@ use subseq_graph::models::{GraphId, GraphNodeId};
 
 use super::{
     MilestoneId, ProjectId, TaskAttachmentFileId, TaskCommentId, TaskId, TaskLinkType, TaskLogId,
-    TaskState,
+    TaskState, deserialize_optional_typed_uuid, deserialize_typed_uuid, parse_typed_uuid,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +144,7 @@ where
                 if trimmed.is_empty() {
                     continue;
                 }
-                let parsed = ProjectId::from_str(trimmed).map_err(|err| {
+                let parsed = parse_typed_uuid::<ProjectId>(trimmed).map_err(|err| {
                     serde::de::Error::custom(format!(
                         "Invalid project id in projectIds '{}': {}",
                         trimmed, err
@@ -196,6 +196,7 @@ pub enum TaskFilterRule {
 pub struct ListTasksQuery {
     #[serde(deserialize_with = "deserialize_project_ids")]
     pub project_ids: Option<Vec<ProjectId>>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub project_id: Option<ProjectId>,
     pub assignee_user_id: Option<UserId>,
     pub state: Option<TaskState>,
@@ -280,12 +281,14 @@ impl ListTasksQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskPayload {
+    #[serde(deserialize_with = "deserialize_typed_uuid")]
     pub project_id: ProjectId,
     pub title: String,
     pub description: Option<String>,
     pub assignee_user_id: Option<UserId>,
     pub priority: Option<i32>,
     pub due_date: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub milestone_id: Option<MilestoneId>,
     pub state: Option<TaskState>,
     pub metadata: Option<Value>,
@@ -301,6 +304,7 @@ pub struct UpdateTaskPayload {
     pub priority: Option<i32>,
     pub due_date: Option<DateTime<Utc>>,
     pub clear_due_date: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub milestone_id: Option<MilestoneId>,
     pub clear_milestone: Option<bool>,
     pub state: Option<TaskState>,
@@ -328,6 +332,7 @@ pub struct TransitionTaskPayload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskLinkPayload {
+    #[serde(deserialize_with = "deserialize_typed_uuid")]
     pub other_task_id: TaskId,
     pub link_type: TaskLinkType,
     pub subtask_parent_state: Option<TaskState>,
@@ -399,6 +404,9 @@ pub struct TaskCascadeImpact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use subseq_util::typed_uuid::TypedUuid;
+    use uuid::Uuid;
 
     fn base_query() -> ListTasksQuery {
         ListTasksQuery {
@@ -441,5 +449,65 @@ mod tests {
             .extract_filter_rule()
             .expect_err("expected invalid RFC3339 date to fail");
         assert!(error.contains("invalid RFC3339"));
+    }
+
+    fn typed_project_id(value: Uuid) -> String {
+        TypedUuid::<ProjectId>::new(value).to_string()
+    }
+
+    fn typed_milestone_id(value: Uuid) -> String {
+        TypedUuid::<MilestoneId>::new(value).to_string()
+    }
+
+    fn typed_task_id(value: Uuid) -> String {
+        TypedUuid::<TaskId>::new(value).to_string()
+    }
+
+    #[test]
+    fn create_task_payload_accepts_typed_ids() {
+        let project_id = Uuid::new_v4();
+        let milestone_id = Uuid::new_v4();
+
+        let payload: CreateTaskPayload = serde_json::from_value(json!({
+            "projectId": typed_project_id(project_id),
+            "title": "Write parser tests",
+            "milestoneId": typed_milestone_id(milestone_id)
+        }))
+        .expect("typed ids should deserialize in task create payload");
+
+        assert_eq!(payload.project_id, ProjectId(project_id));
+        assert_eq!(payload.milestone_id, Some(MilestoneId(milestone_id)));
+    }
+
+    #[test]
+    fn list_tasks_query_accepts_typed_project_ids() {
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+
+        let query: ListTasksQuery = serde_json::from_value(json!({
+            "projectId": typed_project_id(project_a),
+            "projectIds": format!("{},{}", typed_project_id(project_a), typed_project_id(project_b))
+        }))
+        .expect("typed ids should deserialize in task list query");
+
+        assert_eq!(query.project_id, Some(ProjectId(project_a)));
+        assert_eq!(
+            query.project_ids,
+            Some(vec![ProjectId(project_a), ProjectId(project_b)])
+        );
+    }
+
+    #[test]
+    fn create_task_link_payload_accepts_typed_other_task_id() {
+        let other_task_id = Uuid::new_v4();
+
+        let payload: CreateTaskLinkPayload = serde_json::from_value(json!({
+            "otherTaskId": typed_task_id(other_task_id),
+            "linkType": "depends_on"
+        }))
+        .expect("typed ids should deserialize in task link payload");
+
+        assert_eq!(payload.other_task_id, TaskId(other_task_id));
+        assert_eq!(payload.link_type, TaskLinkType::DependsOn);
     }
 }

@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use subseq_auth::prelude::{GroupId, UserId};
 
-use super::{DeadlineSource, MilestoneId, ProjectId, RepeatSchema, TimelineSource};
+use super::{
+    DeadlineSource, MilestoneId, ProjectId, RepeatSchema, TimelineSource,
+    deserialize_optional_typed_uuid, deserialize_typed_uuid,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +94,7 @@ pub struct Milestone {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListMilestonesQuery {
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub project_id: Option<ProjectId>,
     pub completed: Option<bool>,
     pub query: Option<String>,
@@ -112,6 +116,7 @@ impl ListMilestonesQuery {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMilestonePayload {
+    #[serde(deserialize_with = "deserialize_typed_uuid")]
     pub project_id: ProjectId,
     pub milestone_type: MilestoneType,
     pub name: String,
@@ -124,7 +129,9 @@ pub struct CreateMilestonePayload {
     pub repeat_interval_seconds: Option<i64>,
     pub repeat_end: Option<DateTime<Utc>>,
     pub repeat_schema: Option<RepeatSchema>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub next_milestone_id: Option<MilestoneId>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub previous_milestone_id: Option<MilestoneId>,
     pub metadata: Option<Value>,
 }
@@ -146,8 +153,10 @@ pub struct UpdateMilestonePayload {
     pub clear_repeat: Option<bool>,
     pub repeat_end: Option<DateTime<Utc>>,
     pub repeat_schema: Option<RepeatSchema>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub next_milestone_id: Option<MilestoneId>,
     pub clear_next_milestone: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_uuid")]
     pub previous_milestone_id: Option<MilestoneId>,
     pub clear_previous_milestone: Option<bool>,
     pub metadata: Option<Value>,
@@ -158,4 +167,72 @@ pub enum MilestoneUpdate {
     MilestoneCreate { payload: CreateMilestonePayload },
     MilestoneUpdated { payload: UpdateMilestonePayload },
     MilestoneArchive,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use subseq_util::typed_uuid::TypedUuid;
+    use uuid::Uuid;
+
+    fn typed_project_id(value: Uuid) -> String {
+        TypedUuid::<ProjectId>::new(value).to_string()
+    }
+
+    fn typed_milestone_id(value: Uuid) -> String {
+        TypedUuid::<MilestoneId>::new(value).to_string()
+    }
+
+    #[test]
+    fn list_milestones_query_accepts_typed_project_id() {
+        let project_id = Uuid::new_v4();
+        let query: ListMilestonesQuery = serde_json::from_value(json!({
+            "projectId": typed_project_id(project_id)
+        }))
+        .expect("typed project id should deserialize in milestone list query");
+
+        assert_eq!(query.project_id, Some(ProjectId(project_id)));
+    }
+
+    #[test]
+    fn create_milestone_payload_accepts_typed_ids() {
+        let project_id = Uuid::new_v4();
+        let next_id = Uuid::new_v4();
+        let previous_id = Uuid::new_v4();
+
+        let payload: CreateMilestonePayload = serde_json::from_value(json!({
+            "projectId": typed_project_id(project_id),
+            "milestoneType": "checkpoint",
+            "name": "Ship typed IDs",
+            "nextMilestoneId": typed_milestone_id(next_id),
+            "previousMilestoneId": typed_milestone_id(previous_id)
+        }))
+        .expect("typed ids should deserialize in milestone create payload");
+
+        assert_eq!(payload.project_id, ProjectId(project_id));
+        assert_eq!(payload.next_milestone_id, Some(MilestoneId(next_id)));
+        assert_eq!(
+            payload.previous_milestone_id,
+            Some(MilestoneId(previous_id))
+        );
+    }
+
+    #[test]
+    fn update_milestone_payload_accepts_typed_linked_milestones() {
+        let next_id = Uuid::new_v4();
+        let previous_id = Uuid::new_v4();
+
+        let payload: UpdateMilestonePayload = serde_json::from_value(json!({
+            "nextMilestoneId": typed_milestone_id(next_id),
+            "previousMilestoneId": typed_milestone_id(previous_id)
+        }))
+        .expect("typed ids should deserialize in milestone update payload");
+
+        assert_eq!(payload.next_milestone_id, Some(MilestoneId(next_id)));
+        assert_eq!(
+            payload.previous_milestone_id,
+            Some(MilestoneId(previous_id))
+        );
+    }
 }

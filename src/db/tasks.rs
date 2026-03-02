@@ -11,6 +11,7 @@ use subseq_graph::models::{
     GraphInvariantViolation, GraphKind, GraphNodeId, NewGraphNode, RemoveEdgePayload,
     ReparentNodePayload, UpsertEdgeMetadataPayload, UpsertNodePayload,
 };
+use subseq_util::typed_uuid::{FromTypedUuid, TypedUuid};
 
 use super::*;
 
@@ -1309,8 +1310,8 @@ async fn resolve_task_id_by_ref_with_roles(
     task_ref: &str,
     permission: &str,
 ) -> Result<TaskId> {
-    if let Ok(task_uuid) = Uuid::parse_str(task_ref) {
-        let task_id = TaskId(task_uuid);
+    if let Ok(task_uuid) = TypedUuid::<TaskId>::from_str(task_ref) {
+        let task_id = TaskId::from_typed_uuid(task_uuid);
         let _ = load_accessible_task(pool, actor, task_id, permission).await?;
         return Ok(task_id);
     }
